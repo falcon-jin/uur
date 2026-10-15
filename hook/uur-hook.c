@@ -17,6 +17,10 @@
  */
 
 #define WIN32_LEAN_AND_MEAN
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -234,6 +238,9 @@ static uint64_t frame_slot_bytes;
 static unsigned char *frame_snapshot;
 static size_t frame_snapshot_capacity;
 static size_t frame_map_size;
+static BY_HANDLE_FILE_INFORMATION frame_identity;
+static ULONGLONG frame_checked_at;
+static SRWLOCK frame_lock = SRWLOCK_INIT;
 
 static char *read_ini_value(const char *path, const char *key);
 
@@ -264,39 +271,70 @@ static uint64_t load_u64(const unsigned char *p)
     return load_u32(p) | ((uint64_t)load_u32(p + 4) << 32);
 }
 
-/* Open (or re-open after a resolution change) the capture file that the
- * native uur-pw-capture helper publishes. */
+static void clear_frame_map(void)
+{
+    if (frame_map != NULL)
+        UnmapViewOfFile(frame_map);
+    if (frame_map_handle != NULL)
+        CloseHandle(frame_map_handle);
+    frame_map = NULL;
+    frame_map_handle = NULL;
+    frame_map_size = 0;
+}
+
+/* Producers publish immutable geometry via atomic replacement. Re-check the
+ * file identity periodically, including after an ungraceful helper restart. */
 static int ensure_frame_map(void)
 {
     HANDLE file;
     void *view;
     const unsigned char *header;
     LARGE_INTEGER size;
+    BY_HANDLE_FILE_INFORMATION identity;
     WCHAR path[32768];
+    ULONGLONG now = GetTickCount64();
 
-    if (frame_map != NULL)
+    if (frame_map != NULL && now - frame_checked_at < 250 &&
+        load_u64((const unsigned char *)frame_map + 24) != 0)
         return 1;
 
     if (!resolve_frame_path(path, (int)(sizeof(path) / sizeof(path[0]))))
         return 0;
     file = CreateFileW(path, GENERIC_READ,
-                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
                        0, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-        return 0;
-    if (!GetFileSizeEx(file, &size) || size.QuadPart < UURF_HEADER_BYTES ||
-        (uint64_t)size.QuadPart > SIZE_MAX) {
-        CloseHandle(file);
+    if (file == INVALID_HANDLE_VALUE) {
+        clear_frame_map();
         return 0;
     }
+    if (!GetFileInformationByHandle(file, &identity) ||
+        !GetFileSizeEx(file, &size) || size.QuadPart < UURF_HEADER_BYTES ||
+        (uint64_t)size.QuadPart > UURF_HEADER_BYTES +
+            UURF_SLOT_COUNT * (8ull + 256ull * 1024 * 1024)) {
+        CloseHandle(file);
+        clear_frame_map();
+        return 0;
+    }
+    frame_checked_at = now;
+    if (frame_map != NULL &&
+        identity.dwVolumeSerialNumber == frame_identity.dwVolumeSerialNumber &&
+        identity.nFileIndexHigh == frame_identity.nFileIndexHigh &&
+        identity.nFileIndexLow == frame_identity.nFileIndexLow &&
+        (uint64_t)size.QuadPart == frame_map_size) {
+        CloseHandle(file);
+        return 1;
+    }
+    clear_frame_map();
     frame_map_handle = CreateFileMappingW(file, NULL, PAGE_READONLY, 0, 0,
                                           NULL);
     CloseHandle(file);
     if (frame_map_handle == NULL)
         return 0;
     view = MapViewOfFile(frame_map_handle, FILE_MAP_READ, 0, 0, 0);
-    if (view == NULL)
+    if (view == NULL) {
+        clear_frame_map();
         return 0;
+    }
 
     header = (const unsigned char *)view;
     if (load_u32(header) != UURF_MAGIC ||
@@ -311,7 +349,10 @@ static int ensure_frame_map(void)
     frame_stride = load_u32(header + 16);
     frame_slot_bytes = 8ull + (uint64_t)frame_stride * frame_height;
     uint64_t expected = UURF_HEADER_BYTES + UURF_SLOT_COUNT * frame_slot_bytes;
-    if (frame_width == 0 || frame_height == 0 || frame_stride < frame_width * 4 ||
+    if (frame_width == 0 || frame_height == 0 ||
+        frame_width > 16384 || frame_height > 16384 ||
+        frame_stride != frame_width * 4 ||
+        (uint64_t)frame_stride * frame_height > 256ull * 1024 * 1024 ||
         expected > (uint64_t)size.QuadPart) {
         UnmapViewOfFile(view);
         CloseHandle(frame_map_handle);
@@ -320,6 +361,7 @@ static int ensure_frame_map(void)
     }
     frame_map_size = (size_t)size.QuadPart;
     frame_map = view;
+    frame_identity = identity;
     return 1;
 }
 
@@ -389,7 +431,7 @@ static void draw_cursor_overlay(HDC hdc_dest, int x, int y, int width, int heigh
 /* Feed the newest desktop frame into the capture destination by drawing
  * our shared-memory frame with StretchDIBits.  Works regardless of the
  * destination bitmap type (DDB or DIB section). */
-static BOOL feed_capture_frame(HDC hdc_dest, int x, int y, int width,
+static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                                int height, int source_x, int source_y,
                                int source_width, int source_height)
 {
@@ -407,7 +449,8 @@ static BOOL feed_capture_frame(HDC hdc_dest, int x, int y, int width,
     fstride = load_u32(header + 16);
     size_t frame_bytes = (size_t)fstride * fh;
     total = load_u64(header + 24);
-    if (fw == 0 || fh == 0 || fstride < fw * 4 || total == 0 ||
+    if (fw != frame_width || fh != frame_height || fstride != frame_stride ||
+        fw == 0 || fh == 0 || fstride < fw * 4 || total == 0 ||
         frame_bytes / fstride != fh ||
         UURF_HEADER_BYTES + UURF_SLOT_COUNT * frame_slot_bytes > frame_map_size)
         return FALSE;
@@ -470,6 +513,17 @@ static BOOL feed_capture_frame(HDC hdc_dest, int x, int y, int width,
         }
     }
     return ok;
+}
+
+static BOOL feed_capture_frame(HDC hdc_dest, int x, int y, int width,
+                               int height, int source_x, int source_y,
+                               int source_width, int source_height)
+{
+    AcquireSRWLockExclusive(&frame_lock);
+    BOOL result = feed_capture_frame_locked(hdc_dest, x, y, width, height,
+        source_x, source_y, source_width, source_height);
+    ReleaseSRWLockExclusive(&frame_lock);
+    return result;
 }
 
 static BOOL try_capture_feed(HDC hdc_dest, int x, int y, DWORD rop,

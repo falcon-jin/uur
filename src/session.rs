@@ -45,19 +45,21 @@ fn complete_hook_directory(dir: &Path) -> bool {
 }
 
 fn hook_dir() -> Result<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from("/usr/lib/uur/hook"),
-        PathBuf::from("/usr/local/lib/uur/hook"),
-    ];
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".local/lib/uur/hook"));
-    }
+    let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join("../lib/uur/hook"));
             candidates.push(dir.join("../../build/hook"));
             candidates.push(dir.to_path_buf());
         }
+    }
+    candidates.push(PathBuf::from("/usr/lib/uur/hook"));
+    candidates.push(PathBuf::from("/usr/local/lib/uur/hook"));
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(home).join(".local/lib/uur/hook"));
+    }
+    if let Ok(directory) = std::env::current_dir() {
+        candidates.push(directory.join("build/hook"));
     }
     candidates
         .into_iter()
@@ -66,32 +68,7 @@ fn hook_dir() -> Result<PathBuf> {
 }
 
 fn hook_source_dir() -> Result<PathBuf> {
-    let mut candidates = vec![PathBuf::from("/usr/lib/uur/hook")];
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".local/lib/uur/hook"));
-    }
-    candidates.push(
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|d| d.join("../lib/uur/hook")))
-            .unwrap_or_default(),
-    );
-    candidates.push(
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|d| d.join("../../build/hook")))
-            .unwrap_or_default(),
-    );
-    candidates.push(
-        std::env::current_dir()
-            .ok()
-            .map(|dir| dir.join("build/hook"))
-            .unwrap_or_default(),
-    );
-    candidates
-        .into_iter()
-        .find(|dir| complete_hook_directory(dir))
-        .context("hook DLLs not found (run the build first)")
+    hook_dir()
 }
 
 static DEPLOY_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);

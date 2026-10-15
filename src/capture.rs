@@ -13,6 +13,7 @@
 //! a headless remote host.
 
 use anyhow::{anyhow, Context, Result};
+use futures::{FutureExt, StreamExt};
 use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
@@ -20,8 +21,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::config::Config;
+
+type PortalSession =
+    ashpd::desktop::Session<'static, ashpd::desktop::screencast::Screencast<'static>>;
+
+struct PortalCapture {
+    fd: OwnedFd,
+    node: u32,
+    restore_token: Option<String>,
+    session: PortalSession,
+    closed: zbus::proxy::SignalStream<'static>,
+}
 
 /// Run the capture path until interrupted.
 pub fn run_standalone() -> Result<()> {
@@ -62,29 +75,168 @@ pub fn run() -> Result<()> {
     if config.capture_backend != "portal" {
         anyhow::bail!("unknown capture backend {:?}", config.capture_backend);
     }
-    let runtime = tokio::runtime::Runtime::new().context("creating capture runtime")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("creating capture runtime")?;
     // The portal's D-Bus connection runs on this runtime. Keep it running
     // throughout capture, including on capture-only compositors such as niri.
     runtime.block_on(async {
-        let (pw_fd, node) = tokio::select! {
-            result = portal_session(&mut config) => result?,
-            _ = wait_for_stop(&stopping) => return Ok(()),
-        };
-        println!("{}", t!("capture.session_ready", node = node));
-        let mut helper = CaptureHelper(spawn_helper(pw_fd, node)?);
+        let frames = frame_path()?;
+        let mut failures = 0;
+        let mut initial_session = true;
+        let mut display_changes = watch_display_changes().await;
         loop {
+            let opened = tokio::select! {
+                result = portal_session(&mut config, initial_session) => result,
+                _ = wait_for_stop(&stopping) => return Ok(()),
+            };
+            let PortalCapture {
+                fd: pw_fd,
+                node,
+                session,
+                mut closed,
+                ..
+            } = match opened {
+                Ok(opened) => opened,
+                Err(error) if !initial_session && failures < 3 => {
+                    failures += 1;
+                    eprintln!("capture reconnect {failures}/3 failed: {error:#}");
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
+                        _ = wait_for_stop(&stopping) => return Ok(()),
+                    }
+                }
+                Err(error) => return Err(error),
+            };
+            initial_session = false;
+            println!("{}", t!("capture.session_ready", node = node));
+            match std::fs::remove_file(&frames) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).context("retiring the previous capture transport"),
+            }
+            let mut helper = CaptureHelper(spawn_helper(pw_fd, node)?);
+            let mut healthy_since = None;
+            let mut portal_closed = false;
+            let mut reconfigure = false;
+            let status = loop {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_stop(&stopping) => break None,
+                    _ = closed.next() => {
+                        // Mutter can close the old stream before forwarding
+                        // MonitorsChanged. Correlate that layout transaction;
+                        // a user Stop without a display change stays closed.
+                        reconfigure = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            next_display_change(&mut display_changes),
+                        ).await.is_ok();
+                        portal_closed = !reconfigure;
+                        break None;
+                    }
+                    _ = next_display_change(&mut display_changes) => {
+                        reconfigure = true;
+                        break None;
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                        if has_frame(&frames) && healthy_since.is_none() {
+                            healthy_since = Some(Instant::now());
+                        }
+                        if let Some(status) = helper.0.try_wait()
+                            .context("waiting for capture helper")? {
+                            break Some(status);
+                        }
+                    }
+                }
+            };
+            drop(closed);
+            drop(helper);
+            let _ = tokio::time::timeout(Duration::from_secs(2), session.close()).await;
             if stopping.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            if let Some(status) = helper.0.try_wait().context("waiting for capture helper")? {
-                if !status.success() {
-                    anyhow::bail!("{}", t!("capture.helper_failed"));
-                }
-                return Ok(());
+            // Closed without a matching layout change means Stop sharing.
+            // Never silently restore that permission or use direct capture.
+            if portal_closed {
+                anyhow::bail!(
+                    "screen sharing was closed by the portal; restart uur run to share again"
+                );
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if healthy_since.is_some_and(|since| since.elapsed() >= Duration::from_secs(30)) {
+                failures = 0;
+            }
+            if reconfigure {
+                eprintln!("display configuration changed; restoring capture");
+            } else {
+                failures += 1;
+                if failures > 3 {
+                    anyhow::bail!(
+                        "capture recovery failed repeatedly; restart uur run to share again"
+                    );
+                }
+                let status = status.context("capture helper stopped without an exit status")?;
+                if !matches!(status.code(), Some(0 | 75) | None) {
+                    anyhow::bail!(
+                        "{} ({status}); capture recovery stopped",
+                        t!("capture.helper_failed")
+                    );
+                }
+                eprintln!("capture stream interrupted ({status}); reconnecting {failures}/3");
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(1)) => {},
+                _ = wait_for_stop(&stopping) => return Ok(()),
+            }
+            // Several signals can describe one layout transaction. The next
+            // handshake reads the final layout rather than replaying each one.
+            if reconfigure {
+                while let Some(stream) = display_changes.as_mut() {
+                    match stream.next().now_or_never() {
+                        Some(Some(_)) => {}
+                        Some(None) => {
+                            display_changes = None;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
         }
     })
+}
+
+async fn watch_display_changes() -> Option<zbus::proxy::SignalStream<'static>> {
+    let connection = zbus::Connection::session().await.ok()?;
+    let bus = zbus::fdo::DBusProxy::new(&connection).await.ok()?;
+    let name = "org.gnome.Mutter.DisplayConfig".try_into().ok()?;
+    if !bus.name_has_owner(name).await.ok()? {
+        return None;
+    }
+    drop(bus);
+    let proxy = zbus::Proxy::new_owned(
+        connection,
+        "org.gnome.Mutter.DisplayConfig",
+        "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig",
+    )
+    .await
+    .ok()?;
+    proxy.receive_signal("MonitorsChanged").await.ok()
+}
+
+async fn next_display_change(changes: &mut Option<zbus::proxy::SignalStream<'static>>) {
+    loop {
+        match changes.as_mut() {
+            Some(stream) => {
+                if stream.next().await.is_some() {
+                    return;
+                }
+                *changes = None;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
 }
 
 async fn wait_for_stop(stopping: &AtomicBool) {
@@ -175,8 +327,7 @@ fn frame_path() -> Result<PathBuf> {
 /// First attempt reuses the stored restore token; if that fails (stale
 /// token, monitor changed, compositor restart) fall back to one
 /// interactive attempt and store the fresh token.
-#[allow(clippy::type_complexity)]
-async fn portal_session(config: &mut Config) -> Result<(OwnedFd, u32)> {
+async fn portal_session(config: &mut Config, interactive: bool) -> Result<PortalCapture> {
     let saved_token = config.capture_restore_token.clone();
     let screencast = ashpd::desktop::screencast::Screencast::new()
         .await
@@ -188,22 +339,24 @@ async fn portal_session(config: &mut Config) -> Result<(OwnedFd, u32)> {
         .clone()
         .map(Some)
         .into_iter()
-        .chain(std::iter::once(None))
+        .chain(interactive.then_some(None))
     {
         match negotiate(&screencast, source, token.as_deref()).await {
-            Ok((fd, node, fresh_token)) => {
-                if fresh_token != saved_token {
-                    config.capture_restore_token = fresh_token;
+            Ok(capture) => {
+                if capture.restore_token != saved_token {
+                    config.capture_restore_token = capture.restore_token.clone();
                     config.store().context("storing the new restore token")?;
                 }
-                return Ok((fd, node));
+                return Ok(capture);
             }
             Err(error) => {
                 last_error = Some(error);
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("portal session failed")))
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!("capture permission could not be restored; restart uur run to share again")
+    }))
 }
 
 /// Choose a cursor mode from the flags the portal advertises.
@@ -257,13 +410,29 @@ pub(crate) async fn preferred_cursor_mode(
 /// One full portal handshake.  Returns the PipeWire fd, the video node id
 /// and the restore token the portal issued for this selection.
 async fn negotiate(
-    screencast: &ashpd::desktop::screencast::Screencast<'_>,
+    screencast: &ashpd::desktop::screencast::Screencast<'static>,
     source: ashpd::desktop::screencast::SourceType,
     restore_token: Option<&str>,
-) -> Result<(OwnedFd, u32, Option<String>)> {
+) -> Result<PortalCapture> {
     use ashpd::desktop::PersistMode;
 
     let session = screencast.create_session().await?;
+    // Session.Closed carries a{sv}. ashpd 0.10 deserializes it as (), which
+    // silently drops the signal. Subscribe on the SAME connection (the
+    // frontend unicasts it) before starting, and ignore its optional details.
+    let serialized = serde_json::to_value(&session)?;
+    let path = serialized
+        .as_str()
+        .context("invalid portal session path")?
+        .to_owned();
+    let session_proxy = zbus::Proxy::new_owned(
+        screencast.connection().clone(),
+        "org.freedesktop.portal.Desktop",
+        path,
+        "org.freedesktop.portal.Session",
+    )
+    .await?;
+    let closed = session_proxy.receive_signal("Closed").await?;
     let cursor_mode = preferred_cursor_mode(screencast).await?;
 
     screencast
@@ -289,7 +458,13 @@ async fn negotiate(
         .open_pipe_wire_remote(&session)
         .await
         .context("opening the PipeWire remote")?;
-    Ok((fd, node, fresh_token))
+    Ok(PortalCapture {
+        fd,
+        node,
+        restore_token: fresh_token,
+        session,
+        closed,
+    })
 }
 
 pub(crate) fn source_type(value: &str) -> ashpd::desktop::screencast::SourceType {
@@ -310,13 +485,7 @@ pub fn list_wayland_outputs() -> Result<()> {
 }
 
 fn find_helper(name: &str) -> Result<PathBuf> {
-    let mut candidates = vec![
-        PathBuf::from("/usr/lib/uur").join(name),
-        PathBuf::from("/usr/local/lib/uur").join(name),
-    ];
-    if let Ok(home) = std::env::var("HOME") {
-        candidates.push(PathBuf::from(home).join(".local/lib/uur").join(name));
-    }
+    let mut candidates = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         // dev checkout: target/debug/uur -> capture/uur-pw-capture
         if let Some(dir) = exe.parent() {
@@ -324,6 +493,11 @@ fn find_helper(name: &str) -> Result<PathBuf> {
             candidates.push(dir.join("../../capture").join(name));
             candidates.push(dir.join(name));
         }
+    }
+    candidates.push(PathBuf::from("/usr/lib/uur").join(name));
+    candidates.push(PathBuf::from("/usr/local/lib/uur").join(name));
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(home).join(".local/lib/uur").join(name));
     }
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join("capture").join(name));
