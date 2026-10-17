@@ -384,7 +384,7 @@ impl SessionResources {
         for helper in &mut self.helpers {
             if matches!(
                 helper.name.as_str(),
-                "__bridge" | "__capture" | "__terminal" | "__launcher"
+                "__bridge" | "__capture" | "__terminal" | "__launcher" | "winlogon"
             ) {
                 helper.ensure_running()?;
             }
@@ -528,32 +528,46 @@ pub fn start() -> Result<()> {
 
     // The service enumerates processes for a winlogon session token source
     // before it initialises; under plain Wine none exists.  A sleeping
-    // process with that name satisfies the check.
+    // process with that name satisfies the check. It also monitors the
+    // Windows process table without repeatedly initializing Wine utilities.
+    use std::os::unix::process::CommandExt;
     let marker = hook_dir()?.join("winlogon.exe");
-    let _ = Command::new("wine")
+    let mut monitor = Command::new("wine")
         .env("WINEPREFIX", &prefix)
         .env("WINEDEBUG", wine_debug())
-        .env("WINEDLLOVERRIDES", "wevtapi=n,wtsapi32=n")
-        .env("UUR_HOOK_LOG", log_path()?)
-        .env("UUR_BRIDGE_PORT", config.bridge_port.to_string())
-        .env("UUR_BRIDGE_TOKEN", config.bridge_token.clone())
-        .stdout(Stdio::from(log.try_clone()?))
+        .env("WINEDLLOVERRIDES", "wevtapi=b;wtsapi32=b")
+        .env("UUR_MONITOR_CLIENT", "GameViewer.exe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::from(log.try_clone()?))
-        .arg(marker.to_string_lossy().as_ref())
-        .spawn();
+        .process_group(0)
+        .arg(marker)
+        .spawn()
+        .context("starting the Windows session monitor")?;
+    let monitor_output = monitor
+        .stdout
+        .take()
+        .context("missing session monitor pipe")?;
+    resources.helpers.push(ManagedChild {
+        child: monitor,
+        name: "winlogon".to_string(),
+        terminated: false,
+    });
+    let mut client_monitor = ClientMonitor::new(monitor_output)?;
 
     // The launcher talks to the service through the Windows Service Control
     // Manager, so the service must be started through `sc start` — a
     // directly spawned --service process is invisible to it and the UI
     // waits forever.
     if !service_running(&prefix) {
-        let _ = Command::new("wine")
-            .env("WINEPREFIX", &prefix)
-            .env("WINEDEBUG", wine_debug())
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log.try_clone()?))
-            .args(["sc", "start", "GameViewerService"])
-            .status();
+        let _ = run_with_timeout(
+            Command::new("wine")
+                .env("WINEPREFIX", &prefix)
+                .env("WINEDEBUG", wine_debug())
+                .env("WINEDLLOVERRIDES", "wevtapi=b;wtsapi32=b")
+                .args([r"C:\windows\system32\sc.exe", "start", "GameViewerService"]),
+            std::time::Duration::from_secs(5),
+        );
     }
     let service_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !service_running(&prefix) {
@@ -594,17 +608,18 @@ pub fn start() -> Result<()> {
     let mut relaunches = 0;
     while !stopping.load(Ordering::Relaxed) {
         resources.check_required_helpers()?;
-        let running = wine_client_process_exists(&prefix);
-        if running {
-            seen_client = true;
-            missing_checks = 0;
-        } else if seen_client {
-            missing_checks = missing_checks.saturating_add(1);
-            // UU hands off between short-lived launchers and its real Qt
-            // process. Require a sustained absence before treating it as a
-            // user-requested exit.
-            if missing_checks >= 6 {
-                break;
+        if let Some(running) = client_monitor.poll()? {
+            if running {
+                seen_client = true;
+                missing_checks = 0;
+            } else if seen_client {
+                missing_checks = missing_checks.saturating_add(1);
+                // UU hands off between short-lived launchers and its real Qt
+                // process. Require a sustained absence before treating it as a
+                // user-requested exit.
+                if missing_checks >= 6 {
+                    break;
+                }
             }
         }
         if !seen_client && std::time::Instant::now() >= deadline {
@@ -624,26 +639,68 @@ pub fn start() -> Result<()> {
     Ok(())
 }
 
-/// Query the Windows process table belonging to this exact Wine prefix.
+/// Read fresh process-table observations from this prefix's persistent marker.
 /// Modern Wine may host a Windows process in a Linux process whose `/proc`
 /// cmdline names another image, so Linux process-name matching is not a valid
-/// lifecycle boundary.
-fn wine_client_process_exists(prefix: &Path) -> bool {
-    let output = run_with_timeout(
-        Command::new("wine")
-            .env("WINEPREFIX", prefix)
-            .env("WINEDEBUG", wine_debug())
-            .args([
-                "tasklist",
-                "/NH",
-                "/FO",
-                "CSV",
-                "/FI",
-                "IMAGENAME eq GameViewer.exe",
-            ]),
-        std::time::Duration::from_secs(5),
-    );
-    output.is_some_and(|text| tasklist_contains_image(&text, "GameViewer.exe"))
+/// lifecycle boundary. A failed query never means that the client exited.
+struct ClientMonitor {
+    output: std::process::ChildStdout,
+    last_response: std::time::Instant,
+}
+
+impl ClientMonitor {
+    fn new(output: std::process::ChildStdout) -> Result<Self> {
+        set_nonblocking(&output)?;
+        Ok(Self {
+            output,
+            last_response: std::time::Instant::now(),
+        })
+    }
+
+    fn poll(&mut self) -> Result<Option<bool>> {
+        let mut latest = None;
+        let mut buffer = [0; 64];
+        loop {
+            match self.output.read(&mut buffer) {
+                Ok(0) => anyhow::bail!("Windows session monitor disconnected"),
+                Ok(count) => {
+                    for state in &buffer[..count] {
+                        latest = monitor_observation(*state)?;
+                        if latest.is_some() {
+                            self.last_response = std::time::Instant::now();
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error).context("reading Windows session monitor"),
+            }
+        }
+        if self.last_response.elapsed() > std::time::Duration::from_secs(15) {
+            anyhow::bail!(
+                "Windows session monitor did not provide a valid observation for 15 seconds"
+            );
+        }
+        Ok(latest)
+    }
+}
+
+fn monitor_observation(state: u8) -> Result<Option<bool>> {
+    match state {
+        b'1' => Ok(Some(true)),
+        b'0' => Ok(Some(false)),
+        b'?' => Ok(None),
+        _ => anyhow::bail!("invalid Windows session monitor response"),
+    }
+}
+
+fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Run a command with a hard timeout, returning its stdout (None on
@@ -654,30 +711,49 @@ fn run_with_timeout(command: &mut Command, timeout: std::time::Duration) -> Opti
     use std::process::Stdio;
 
     let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    let mut pipe = child.stdout.take()?;
+    if set_nonblocking(&pipe).is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    let mut stdout = Vec::new();
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
+        // Check exit before draining, so the command's final output is not
+        // lost in a wait/read race. Never wait for EOF: Wine descendants can
+        // retain this pipe after the utility itself has exited.
+        let status = child.try_wait();
+        let read = pipe
+            .by_ref()
+            .take(65537 - stdout.len() as u64)
+            .read_to_end(&mut stdout);
+        let read_failed = read.is_err_and(|error| {
+            !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            )
+        });
+        if !read_failed && stdout.len() <= 65536 {
+            if let Ok(Some(status)) = status {
+                return status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&stdout).into_owned());
             }
-            Err(_) => return None,
+            if status.is_ok() && std::time::Instant::now() < deadline {
+                thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
         }
-        thread::sleep(std::time::Duration::from_millis(50));
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
     }
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    Some(stdout)
 }
 
 /// True when the Windows service reports STATE 4 (RUNNING) via `sc query`.
@@ -686,7 +762,8 @@ fn service_running(prefix: &Path) -> bool {
         Command::new("wine")
             .env("WINEPREFIX", prefix)
             .env("WINEDEBUG", wine_debug())
-            .args(["sc", "query", "GameViewerService"]),
+            .env("WINEDLLOVERRIDES", "wevtapi=b;wtsapi32=b")
+            .args([r"C:\windows\system32\sc.exe", "query", "GameViewerService"]),
         std::time::Duration::from_secs(3),
     );
     match output {
@@ -696,15 +773,6 @@ fn service_running(prefix: &Path) -> bool {
         }),
         None => false,
     }
-}
-
-fn tasklist_contains_image(output: &str, image: &str) -> bool {
-    output.lines().any(|line| {
-        line.split(',')
-            .next()
-            .map(|field| field.trim().trim_matches('"').eq_ignore_ascii_case(image))
-            .unwrap_or(false)
-    })
 }
 
 fn log_path() -> Result<PathBuf> {
@@ -901,10 +969,103 @@ fn parse_xft_dpi(resources: &str) -> Option<u32> {
 }
 
 fn stop_wineserver(prefix: &Path) {
-    let _ = Command::new("wineserver")
-        .env("WINEPREFIX", prefix)
-        .arg("-k")
-        .status();
+    // Capture handles before Wine's shutdown: a WebView2 thread-group leader
+    // can exit while its other threads retain the address space and pipes.
+    let mut remaining = remaining_wine_processes(prefix);
+    let _ = run_with_timeout(
+        Command::new("wineserver")
+            .env("WINEPREFIX", prefix)
+            .arg("-k"),
+        std::time::Duration::from_secs(2),
+    );
+    // WebView2 workers can outlive their wineserver, blocked on inherited
+    // pipes. Bind a pidfd before checking identity: PID reuse must never turn
+    // cleanup of this managed prefix into a signal to an unrelated process.
+    remaining.extend(remaining_wine_processes(prefix));
+    for process in &remaining {
+        signal_process(process, libc::SIGTERM);
+    }
+    if !remaining.is_empty() {
+        thread::sleep(std::time::Duration::from_millis(250));
+        for process in &remaining {
+            signal_process(process, libc::SIGKILL);
+        }
+    }
+}
+
+fn remaining_wine_processes(prefix: &Path) -> Vec<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+
+    let Ok(prefix) = std::fs::canonicalize(prefix) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut processes = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+        if fd < 0 {
+            continue;
+        }
+        let process = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let directory = entry.path();
+        let belongs_to_prefix = wine_process_matches(&directory, &prefix)
+            || (std::fs::read_link(directory.join("exe")).is_err()
+                && std::fs::read_dir(directory.join("task")).is_ok_and(|tasks| {
+                    tasks
+                        .flatten()
+                        .any(|task| wine_process_matches(&task.path(), &prefix))
+                }));
+        if belongs_to_prefix {
+            processes.push(process);
+        }
+    }
+    processes
+}
+
+fn wine_process_matches(directory: &Path, prefix: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(executable) = std::fs::read_link(directory.join("exe")) else {
+        return false;
+    };
+    if !matches!(
+        executable.file_name().and_then(|name| name.to_str()),
+        Some("wine" | "wine64" | "wine-preloader" | "wine64-preloader" | "wineserver")
+    ) {
+        return false;
+    }
+    let Ok(environment) = std::fs::read(directory.join("environ")) else {
+        return false;
+    };
+    environment.split(|byte| *byte == 0).any(|variable| {
+        variable.strip_prefix(b"WINEPREFIX=").is_some_and(|value| {
+            let path = Path::new(std::ffi::OsStr::from_bytes(value));
+            path.is_absolute() && std::fs::canonicalize(path).is_ok_and(|path| path == prefix)
+        })
+    })
+}
+
+fn signal_process(process: &std::os::fd::OwnedFd, signal: i32) {
+    use std::os::fd::AsRawFd;
+
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            process.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        );
+    }
 }
 
 fn wine_debug() -> String {
@@ -1026,11 +1187,11 @@ mod tests {
     }
 
     #[test]
-    fn tasklist_parser_matches_the_exact_image() {
-        let output = "\"GameViewer.exe\",\"456\",\"Console\",\"1\"\n\
-                      \"GameViewerServer.exe\",\"464\",\"Console\",\"1\"\n";
-        assert!(tasklist_contains_image(output, "GameViewer.exe"));
-        assert!(!tasklist_contains_image(output, "GameViewerService.exe"));
+    fn monitor_parser_distinguishes_absence_and_query_failure() {
+        assert_eq!(monitor_observation(b'1').unwrap(), Some(true));
+        assert_eq!(monitor_observation(b'0').unwrap(), Some(false));
+        assert_eq!(monitor_observation(b'?').unwrap(), None);
+        assert!(monitor_observation(b'X').is_err());
     }
 
     #[test]
