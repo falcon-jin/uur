@@ -46,7 +46,7 @@ paru -S uur
 From a downloaded Arch package:
 
 ```bash
-sudo pacman -U ./uur-0.1.5-1-x86_64.pkg.tar.zst
+sudo pacman -U ./uur-0.1.6-1-x86_64.pkg.tar.zst
 ```
 
 Install the portal backend supplied or recommended by the selected desktop.
@@ -60,7 +60,7 @@ Zorin OS, elementary OS, KDE neon, TUXEDO OS, Kali Linux, MX Linux, and other
 compatible derivatives:
 
 ```bash
-sudo apt install ./uur_0.1.5_amd64.deb
+sudo apt install ./uur_0.1.6_amd64.deb
 ```
 
 The package manager resolves Wine, PipeWire, and the portal frontend. Install
@@ -74,10 +74,10 @@ dependency names. Install it with the native frontend:
 
 ```bash
 # Fedora and compatible systems
-sudo dnf install ./uur-0.1.5-1.x86_64.rpm
+sudo dnf install ./uur-0.1.6-1.x86_64.rpm
 
 # openSUSE family
-sudo zypper install ./uur-0.1.5-1.x86_64.rpm
+sudo zypper install ./uur-0.1.6-1.x86_64.rpm
 ```
 
 RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Oracle Linux, Nobara, Ultramarine,
@@ -91,7 +91,7 @@ PCLinuxOS, and similar mutable/FHS systems can use the portable archive when
 they provide compatible glibc, Wine, PipeWire, and portal libraries:
 
 ```bash
-sudo tar --zstd -C / -xf ./uur-0.1.5-linux-x86_64.tar.zst
+sudo tar --zstd -C / -xf ./uur-0.1.6-linux-x86_64.tar.zst
 ```
 
 Alternatively, build and install for one user:
@@ -242,6 +242,18 @@ Stop only the managed session and its Wine prefix with:
 ```bash
 uur stop
 ```
+
+The session tracks `GameViewer.exe` in its own Wine prefix through the
+resident `winlogon.exe` adapter. This uses the Windows process table even when
+the client changes its Linux process title. It keeps a three-second handoff
+grace period without repeatedly starting `tasklist`. A failed process query
+is not treated as a client exit; a disconnected or unresponsive monitor ends
+the session with an explicit error. Stopping the session also stops this
+adapter and the capture/input helpers. Remaining Wine workers, including
+WebView2 processes that outlive their wineserver, are matched to this prefix
+and signaled through Linux pidfds to avoid PID-reuse races. Other Wine prefixes
+are left running. This residual-process cleanup needs Linux 5.3 or later;
+older kernels still use Wine's normal wineserver shutdown.
 
 Useful input-backend overrides for diagnosis are:
 

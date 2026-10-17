@@ -69,7 +69,7 @@ recipes and release artifacts share one version and filesystem layout.
 Install a downloaded release package with pacman:
 
 ```bash
-sudo pacman -U ./dist/uur-0.1.5-1-x86_64.pkg.tar.zst
+sudo pacman -U ./dist/uur-0.1.6-1-x86_64.pkg.tar.zst
 ```
 
 ### AUR
@@ -83,13 +83,13 @@ paru -S uur
 ### Debian and Ubuntu package family
 
 ```bash
-sudo apt install ./uur_0.1.5_amd64.deb
+sudo apt install ./uur_0.1.6_amd64.deb
 ```
 
 ### Fedora and compatible RPM systems
 
 ```bash
-sudo dnf install ./uur-0.1.5-1.x86_64.rpm
+sudo dnf install ./uur-0.1.6-1.x86_64.rpm
 ```
 
 On systems with different RPM dependency names, install the dependencies
@@ -98,7 +98,7 @@ manually or use the portable archive.
 ### Portable archive
 
 ```bash
-sudo tar --zstd -C / -xf ./uur-0.1.5-linux-x86_64.tar.zst
+sudo tar --zstd -C / -xf ./uur-0.1.6-linux-x86_64.tar.zst
 ```
 
 ### Nix and NixOS

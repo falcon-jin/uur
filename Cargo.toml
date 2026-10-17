@@ -1,6 +1,6 @@
 [package]
 name = "uur"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Native Linux companion for NetEase UU Remote: X11/Wayland input and capture, packaged as a regular desktop app"
 license = "MIT"
