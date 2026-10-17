@@ -50,6 +50,13 @@ the managed prefix configuration. It is never a global shared-memory name.
 
 ## Geometry and session changes
 
+An exact Wine monitor rectangle maps onto the entire selected frame when their
+aspect ratios match. Pixel dimensions may differ under fractional scaling, where
+Xwayland's render size can exceed the portal's native frame size. Partial regions
+and whole-virtual-desktop requests retain the existing virtual-desktop mapping.
+This does not establish monitor identity between Wine and the portal; selecting
+a non-primary monitor still requires consistent client/input coordinates.
+
 Each transport inode has immutable geometry. A negotiated size change creates
 a new mode-0600 file, initializes its header and slots, then atomically replaces
 the transport path. The previous mapping remains valid for existing readers;

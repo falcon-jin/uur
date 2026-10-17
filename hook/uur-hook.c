@@ -492,10 +492,48 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                 screen_width = (int)fw;
             if (screen_height < 1)
                 screen_height = (int)fh;
-            int sx = (int)((int64_t)source_x * fw / screen_width);
-            int sy = (int)((int64_t)source_y * fh / screen_height);
-            int sw = (int)((int64_t)source_width * fw / screen_width);
-            int sh = (int)((int64_t)source_height * fh / screen_height);
+            /* The frame holds exactly one monitor, but the client may ask
+             * for that monitor's whole rectangle.  Wine reports the
+             * compositor's monitors in its own order, so the virtual desktop
+             * is only the right basis for a partial request; a complete
+             * monitor request must map onto the whole frame. Fractional
+             * scaling can give Xwayland and the portal different pixel
+             * sizes, so compare aspect ratios rather than resolutions. */
+            int sx = 0;
+            int sy = 0;
+            int sw = 0;
+            int sh = 0;
+            RECT requested;
+            requested.left = (LONG)source_x;
+            requested.top = (LONG)source_y;
+            requested.right = (LONG)source_x + (LONG)source_width;
+            requested.bottom = (LONG)source_y + (LONG)source_height;
+            HMONITOR monitor = (source_width > 0 && source_height > 0)
+                                   ? MonitorFromRect(&requested, MONITOR_DEFAULTTONULL)
+                                   : NULL;
+            MONITORINFO info;
+            info.cbSize = sizeof(info);
+            BOOL whole_monitor = FALSE;
+            if (monitor != NULL && GetMonitorInfoA(monitor, &info)) {
+                whole_monitor =
+                    info.rcMonitor.left == requested.left &&
+                    info.rcMonitor.top == requested.top &&
+                    info.rcMonitor.right == requested.right &&
+                    info.rcMonitor.bottom == requested.bottom &&
+                    (int64_t)(info.rcMonitor.right - info.rcMonitor.left) * fh ==
+                        (int64_t)(info.rcMonitor.bottom - info.rcMonitor.top) * fw;
+            }
+            if (whole_monitor) {
+                sx = 0;
+                sy = 0;
+                sw = (int)fw;
+                sh = (int)fh;
+            } else {
+                sx = (int)((int64_t)source_x * fw / screen_width);
+                sy = (int)((int64_t)source_y * fh / screen_height);
+                sw = (int)((int64_t)source_width * fw / screen_width);
+                sh = (int)((int64_t)source_height * fh / screen_height);
+            }
             if (sw < 1)
                 sw = (int)fw;
             if (sh < 1)
