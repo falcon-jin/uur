@@ -15,6 +15,10 @@ command -v makepkg >/dev/null 2>&1 || {
     exit 2
 }
 
+cargo build --manifest-path "$project_root/Cargo.toml" --release --locked
+"$project_root/hook/build.sh"
+"$project_root/capture/build.sh"
+
 sed -e "s|@UUR_VERSION@|$version|g" \
     -e "s|@UUR_PROJECT_ROOT@|$project_root|g" \
     "$project_root/packaging/arch/PKGBUILD.in" >"$build_dir/PKGBUILD"
