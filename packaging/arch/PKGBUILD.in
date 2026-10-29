@@ -1,6 +1,6 @@
 pkgname=uur
 pkgver=@UUR_VERSION@
-pkgrel=1
+pkgrel=3
 pkgdesc="Native Linux companion for NetEase UU Remote"
 arch=('x86_64')
 url="https://github.com/panxuc/uur"

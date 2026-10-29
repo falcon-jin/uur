@@ -9,7 +9,7 @@
 
 pkgname=uur
 pkgver=0.1.6
-pkgrel=1
+pkgrel=3
 pkgdesc="Native Linux companion for NetEase UU Remote (X11/Wayland input and capture bridge)"
 arch=('x86_64')
 url="https://github.com/panxuc/uur"
