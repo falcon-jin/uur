@@ -1121,7 +1121,24 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                                     (LONG)left, (LONG)top,
                                     (LONG)(left + capture_w),
                                     (LONG)(top + capture_h)};
-                                if (requested.left >= adjusted.left &&
+                                /* A full-stream request is already in captured
+                                 * pixel coordinates. Wine can still report the
+                                 * prior logical rcMonitor size here; scaling
+                                 * against that stale rectangle crops the stream. */
+                                if (source_width > 0 && source_height > 0 &&
+                                    (uint32_t)source_width == capture_w &&
+                                    (uint32_t)source_height == capture_h &&
+                                    frame_w > 0 && frame_h > 0 &&
+                                    frame_x <= fw && frame_y <= fh &&
+                                    frame_w <= fw - frame_x &&
+                                    frame_h <= fh - frame_y) {
+                                    sx = (int)frame_x;
+                                    sy = (int)frame_y;
+                                    sw = (int)frame_w;
+                                    sh = (int)frame_h;
+                                    monitor_local_crop = TRUE;
+                                    crop_mode = "stream-full";
+                                } else if (requested.left >= adjusted.left &&
                                     requested.top >= adjusted.top &&
                                     requested.right <= adjusted.right &&
                                     requested.bottom <= adjusted.bottom) {
@@ -1133,7 +1150,8 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                             }
                         }
                     }
-                    if (requested.left >= crop_monitor.left &&
+                    if (!monitor_local_crop &&
+                        requested.left >= crop_monitor.left &&
                         requested.top >= crop_monitor.top &&
                         requested.right <= crop_monitor.right &&
                         requested.bottom <= crop_monitor.bottom &&
@@ -1209,7 +1227,7 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                 sy = 0;
                 sw = (int)fw;
                 sh = (int)fh;
-            } else {
+            } else if (!monitor_local_crop) {
                 int screen_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
                 int screen_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
                 int64_t sx0 = ((int64_t)source_x - screen_left) * fw /
