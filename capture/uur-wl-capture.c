@@ -148,6 +148,8 @@ static int setup_ring(struct capture *c)
     header->monitors[0].frame_y = 0;
     header->monitors[0].frame_width = c->width;
     header->monitors[0].frame_height = c->height;
+    header->monitors[0].capture_width = c->width;
+    header->monitors[0].capture_height = c->height;
     for (uint32_t i = 0; i < UURF_SLOT_COUNT; ++i) {
         _Atomic uint64_t *seq = (_Atomic uint64_t *)((uint8_t *)c->ring +
             UURF_HEADER_BYTES + i * (sizeof(uint64_t) + bytes));

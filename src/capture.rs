@@ -25,6 +25,8 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 
+const FRAME_PROTOCOL_VERSION: u32 = 3;
+
 type PortalSession =
     ashpd::desktop::Session<'static, ashpd::desktop::screencast::Screencast<'static>>;
 
@@ -290,7 +292,7 @@ pub(crate) fn has_frame(path: &Path) -> bool {
     }
     let field = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
     field(0) == 0x4652_5555
-        && field(4) == 2
+        && field(4) == FRAME_PROTOCOL_VERSION
         && field(8) > 0
         && field(12) > 0
         && field(16) >= field(8).saturating_mul(4)

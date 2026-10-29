@@ -21,12 +21,12 @@ uur-hook.dll ── intercepts static/dynamic gdi32!BitBlt/StretchBlt calls;
 
 ## Shared file layout
 
-All integers little-endian. Total size = 576 + 3 × (8 + stride × height).
+All integers little-endian. Total size = 704 + 3 × (8 + stride × height).
 
 | offset | type | field |
 | --- | --- | --- |
 | 0 | u32 | magic `0x46525555` ("UURF") |
-| 4 | u32 | protocol version = 2 |
+| 4 | u32 | protocol version = 3 |
 | 8 | u32 | frame width (px) |
 | 12 | u32 | frame height (px) |
 | 16 | u32 | stride (bytes per row) |
@@ -37,13 +37,14 @@ All integers little-endian. Total size = 576 + 3 × (8 + stride × height).
 | 40..64 | — | reserved, zero |
 
 The fixed-size monitor table starts at offset 64 and contains 16 records of
-32 bytes each. Unused records are zero. Each record contains signed logical
+40 bytes each. Unused records are zero. Each record contains signed logical
 `x` and `y`, logical `width` and `height`, then unsigned `frame_x`, `frame_y`,
 `frame_width` and `frame_height` describing that monitor's rectangle in the
-composited frame. A single-stream capture has one record covering the full
-frame.
+composited frame, then `capture_width` and `capture_height` for the negotiated
+source stream resolution. A single-stream capture has one record covering the
+full frame.
 
-Slot *i* (i = 0, 1, 2) at offset `576 + i × (8 + stride × height)`:
+Slot *i* (i = 0, 1, 2) at offset `704 + i × (8 + stride × height)`:
 
 | offset | type | field |
 | --- | --- | --- |

@@ -205,6 +205,8 @@ static int shm_setup(struct capture *c)
         monitor->logical_y = s->layout_y;
         monitor->logical_width = s->logical_width;
         monitor->logical_height = s->logical_height;
+        monitor->capture_width = s->width;
+        monitor->capture_height = s->height;
         if (c->flags == 0) {
             monitor->frame_x = 0;
             monitor->frame_y = 0;
