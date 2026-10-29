@@ -700,10 +700,30 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                 sw = (int)fw;
                 sh = (int)fh;
             } else {
-                sx = (int)((int64_t)source_x * fw / screen_width);
-                sy = (int)((int64_t)source_y * fh / screen_height);
-                sw = (int)((int64_t)source_width * fw / screen_width);
-                sh = (int)((int64_t)source_height * fh / screen_height);
+                int screen_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                int screen_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                int64_t sx0 = ((int64_t)source_x - screen_left) * fw /
+                              screen_width;
+                int64_t sy0 = ((int64_t)source_y - screen_top) * fh /
+                              screen_height;
+                int64_t sx1 = ((int64_t)source_x + source_width - screen_left) *
+                              fw / screen_width;
+                int64_t sy1 = ((int64_t)source_y + source_height - screen_top) *
+                              fh / screen_height;
+                if (sx0 < 0)
+                    sx0 = 0;
+                if (sy0 < 0)
+                    sy0 = 0;
+                if (sx1 > fw)
+                    sx1 = fw;
+                if (sy1 > fh)
+                    sy1 = fh;
+                if (sx1 <= sx0 || sy1 <= sy0)
+                    return FALSE;
+                sx = (int)sx0;
+                sy = (int)sy0;
+                sw = (int)(sx1 - sx0);
+                sh = (int)(sy1 - sy0);
             }
             if (sw < 1)
                 sw = (int)fw;
