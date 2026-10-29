@@ -290,11 +290,12 @@ pub(crate) fn has_frame(path: &Path) -> bool {
     }
     let field = |offset| u32::from_le_bytes(header[offset..offset + 4].try_into().unwrap());
     field(0) == 0x4652_5555
-        && field(4) == 1
+        && field(4) == 2
         && field(8) > 0
         && field(12) > 0
         && field(16) >= field(8).saturating_mul(4)
         && field(20) == 1
+        && (1..=16).contains(&field(36))
         && u64::from_le_bytes(header[24..32].try_into().unwrap()) > 0
 }
 
@@ -353,7 +354,7 @@ fn frame_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("UUR_FRAME_PATH") {
         return Ok(PathBuf::from(path));
     }
-    Ok(crate::config::runtime_dir()?.join("frames.v1"))
+    Ok(crate::config::runtime_dir()?.join("frames.v2"))
 }
 
 /// Open the portal session and return its PipeWire streams and node ids.

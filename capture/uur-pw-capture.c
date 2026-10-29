@@ -49,11 +49,18 @@ struct frame_header {
     uint32_t format;
     _Atomic uint64_t total_frames;
     uint32_t flags;
-    uint8_t reserved[28];
+    uint32_t monitor_count;
+    uint8_t reserved[24];
+    struct uurf_monitor_layout monitors[UURF_MAX_MONITORS];
 };
 
 _Static_assert(sizeof(struct frame_header) == UURF_HEADER_BYTES,
                "frame protocol header size changed");
+
+static uint32_t scale_floor(uint64_t value, uint32_t numerator,
+                            uint32_t denominator);
+static uint64_t scale_ceil(uint64_t value, uint32_t numerator,
+                           uint32_t denominator);
 
 struct frame_slot {
     _Atomic uint64_t seq;
@@ -190,6 +197,34 @@ static int shm_setup(struct capture *c)
     header->format = FRAME_FORMAT_BGRX;
     atomic_init(&header->total_frames, 0);
     header->flags = c->flags;
+    header->monitor_count = c->stream_count;
+    for (uint32_t i = 0; i < c->stream_count; ++i) {
+        const struct capture_stream *s = &c->streams[i];
+        struct uurf_monitor_layout *monitor = &header->monitors[i];
+        monitor->logical_x = s->layout_x;
+        monitor->logical_y = s->layout_y;
+        monitor->logical_width = s->logical_width;
+        monitor->logical_height = s->logical_height;
+        if (c->flags == 0) {
+            monitor->frame_x = 0;
+            monitor->frame_y = 0;
+            monitor->frame_width = c->width;
+            monitor->frame_height = c->height;
+        } else {
+            uint64_t left = (uint64_t)((int64_t)s->layout_x - c->layout_x);
+            uint64_t top = (uint64_t)((int64_t)s->layout_y - c->layout_y);
+            uint32_t x0 = scale_floor(left, c->scale_num, c->scale_den);
+            uint32_t y0 = scale_floor(top, c->scale_num, c->scale_den);
+            uint32_t x1 = scale_ceil(left + s->logical_width,
+                                     c->scale_num, c->scale_den);
+            uint32_t y1 = scale_ceil(top + s->logical_height,
+                                     c->scale_num, c->scale_den);
+            monitor->frame_x = x0;
+            monitor->frame_y = y0;
+            monitor->frame_width = x1 > x0 ? x1 - x0 : 1;
+            monitor->frame_height = y1 > y0 ? y1 - y0 : 1;
+        }
+    }
     for (uint32_t i = 0; i < UURF_SLOT_COUNT; ++i) {
         struct frame_slot *slot = (struct frame_slot *)(mapping +
             UURF_HEADER_BYTES + i * slot_bytes);

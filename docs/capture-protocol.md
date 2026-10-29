@@ -12,7 +12,7 @@ xdg-desktop-portal ScreenCast
 uur-pw-capture (C) ── PipeWire streams, BGRx, desktop composition
         │ writes slots, seqlock per slot
         ▼
-$XDG_RUNTIME_DIR/uur/frames.v1  (mode 0600, 64-byte header + 3 slots)
+$XDG_RUNTIME_DIR/uur/frames.v2  (mode 0600, 576-byte header + 3 slots)
         │ mapped read-only by the PE hook through its configured Wine Z: path
         ▼
 uur-hook.dll ── intercepts static/dynamic gdi32!BitBlt/StretchBlt calls;
@@ -21,21 +21,29 @@ uur-hook.dll ── intercepts static/dynamic gdi32!BitBlt/StretchBlt calls;
 
 ## Shared file layout
 
-All integers little-endian.  Total size = 64 + 3 × (8 + stride × height).
+All integers little-endian. Total size = 576 + 3 × (8 + stride × height).
 
 | offset | type | field |
 | --- | --- | --- |
 | 0 | u32 | magic `0x46525555` ("UURF") |
-| 4 | u32 | protocol version = 1 |
+| 4 | u32 | protocol version = 2 |
 | 8 | u32 | frame width (px) |
 | 12 | u32 | frame height (px) |
 | 16 | u32 | stride (bytes per row) |
 | 20 | u32 | format: 1 = BGRx (32 bits per pixel) |
 | 24 | u64 | total frames written (monotonic counter) |
 | 32 | u32 | flags: bit 0 means the frame is a virtual-desktop composite |
-| 36..64 | — | reserved, zero |
+| 36 | u32 | monitor layout record count (1..16) |
+| 40..64 | — | reserved, zero |
 
-Slot *i* (i = 0, 1, 2) at offset `64 + i × (8 + stride × height)`:
+The fixed-size monitor table starts at offset 64 and contains 16 records of
+32 bytes each. Unused records are zero. Each record contains signed logical
+`x` and `y`, logical `width` and `height`, then unsigned `frame_x`, `frame_y`,
+`frame_width` and `frame_height` describing that monitor's rectangle in the
+composited frame. A single-stream capture has one record covering the full
+frame.
+
+Slot *i* (i = 0, 1, 2) at offset `576 + i × (8 + stride × height)`:
 
 | offset | type | field |
 | --- | --- | --- |
@@ -59,7 +67,9 @@ the producer uses portal position/size metadata to compose the streams into a
 virtual desktop frame; Wine monitor rectangles then crop their matching region.
 If a portal omits layout metadata, streams are arranged left to right. Fractional
 scaling is normalized to a shared frame scale; each stream is resampled into
-its reported logical rectangle.
+its reported logical rectangle. The hook matches Wine monitor bounds to the
+captured layout and crops in monitor-local coordinates, so differing monitor
+resolutions and vertical offsets do not shift the top edge of a screen.
 
 Each transport inode has immutable geometry. A negotiated size change creates
 a new mode-0600 file, initializes its header and slots, then atomically replaces

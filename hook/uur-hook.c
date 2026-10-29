@@ -235,6 +235,7 @@ static uint32_t frame_width;
 static uint32_t frame_height;
 static uint32_t frame_stride;
 static uint32_t frame_flags;
+static uint32_t frame_monitor_count;
 static uint64_t frame_slot_bytes;
 static unsigned char *frame_snapshot;
 static size_t frame_snapshot_capacity;
@@ -282,6 +283,7 @@ static void clear_frame_map(void)
     frame_map_handle = NULL;
     frame_map_size = 0;
     frame_flags = 0;
+    frame_monitor_count = 0;
 }
 
 /* Producers publish immutable geometry via atomic replacement. Re-check the
@@ -350,10 +352,12 @@ static int ensure_frame_map(void)
     frame_height = load_u32(header + 12);
     frame_stride = load_u32(header + 16);
     frame_flags = load_u32(header + 32);
+    frame_monitor_count = load_u32(header + 36);
     frame_slot_bytes = 8ull + (uint64_t)frame_stride * frame_height;
     uint64_t expected = UURF_HEADER_BYTES + UURF_SLOT_COUNT * frame_slot_bytes;
     if (frame_width == 0 || frame_height == 0 ||
         frame_width > 16384 || frame_height > 16384 ||
+        frame_monitor_count == 0 || frame_monitor_count > UURF_MAX_MONITORS ||
         frame_stride != frame_width * 4 ||
         (uint64_t)frame_stride * frame_height > 256ull * 1024 * 1024 ||
         expected > (uint64_t)size.QuadPart) {
@@ -366,6 +370,91 @@ static int ensure_frame_map(void)
     frame_map = view;
     frame_identity = identity;
     return 1;
+}
+
+static int64_t abs_i64(int64_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+/* Pick the captured stream corresponding to a Wine monitor. Exact dimensions
+ * distinguish the common mixed-resolution setup; normalized layout position
+ * and aspect ratio disambiguate equal-sized monitors and scaled desktops. */
+static const unsigned char *find_frame_monitor(const unsigned char *header,
+                                               const RECT *target,
+                                               int screen_left,
+                                               int screen_top,
+                                               int screen_width,
+                                               int screen_height)
+{
+    const unsigned char *best = NULL;
+    int64_t min_x = INT64_MAX, min_y = INT64_MAX;
+    int64_t max_x = INT64_MIN, max_y = INT64_MIN;
+    int64_t target_width = (int64_t)target->right - target->left;
+    int64_t target_height = (int64_t)target->bottom - target->top;
+    int64_t target_center_x = (int64_t)target->left + target->right;
+    int64_t target_center_y = (int64_t)target->top + target->bottom;
+    int64_t best_score = INT64_MAX;
+
+    if (screen_width <= 0 || screen_height <= 0 || target_width <= 0 ||
+        target_height <= 0 || frame_monitor_count == 0 ||
+        frame_monitor_count != (uint32_t)GetSystemMetrics(SM_CMONITORS))
+        return NULL;
+
+    for (uint32_t i = 0; i < frame_monitor_count; ++i) {
+        const unsigned char *item = header + UURF_BASE_HEADER_BYTES +
+                                    i * UURF_MONITOR_BYTES;
+        int64_t x = (int32_t)load_u32(item);
+        int64_t y = (int32_t)load_u32(item + 4);
+        int64_t width = load_u32(item + 8);
+        int64_t height = load_u32(item + 12);
+        if (x < min_x)
+            min_x = x;
+        if (y < min_y)
+            min_y = y;
+        if (x + width > max_x)
+            max_x = x + width;
+        if (y + height > max_y)
+            max_y = y + height;
+    }
+    if (max_x <= min_x || max_y <= min_y)
+        return NULL;
+
+    int64_t target_x = ((target_center_x - 2ll * screen_left) * 1000000) /
+                       (2ll * screen_width);
+    int64_t target_y = ((target_center_y - 2ll * screen_top) * 1000000) /
+                       (2ll * screen_height);
+
+    for (uint32_t i = 0; i < frame_monitor_count; ++i) {
+        const unsigned char *item = header + UURF_BASE_HEADER_BYTES +
+                                    i * UURF_MONITOR_BYTES;
+        int64_t x = (int32_t)load_u32(item);
+        int64_t y = (int32_t)load_u32(item + 4);
+        int64_t width = load_u32(item + 8);
+        int64_t height = load_u32(item + 12);
+        int64_t center_x = ((2 * x + width - 2 * min_x) * 1000000) /
+                           (2 * (max_x - min_x));
+        int64_t center_y = ((2 * y + height - 2 * min_y) * 1000000) /
+                           (2 * (max_y - min_y));
+        int64_t size_error =
+            abs_i64(target_width - width) * 1000000 /
+                (target_width > width ? target_width : width) +
+            abs_i64(target_height - height) * 1000000 /
+                (target_height > height ? target_height : height);
+        int64_t aspect_left = target_width * height;
+        int64_t aspect_right = target_height * width;
+        int64_t aspect_error =
+            abs_i64(aspect_left - aspect_right) * 1000000 /
+            (aspect_left > aspect_right ? aspect_left : aspect_right);
+        int64_t position_error = abs_i64(target_x - center_x) +
+                                 abs_i64(target_y - center_y);
+        int64_t score = size_error * 16 + position_error * 2 + aspect_error;
+        if (score < best_score) {
+            best_score = score;
+            best = item;
+        }
+    }
+    return best;
 }
 
 static BOOL source_is_screen_dc(HDC source)
@@ -514,8 +603,10 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
             MONITORINFO info;
             info.cbSize = sizeof(info);
             BOOL whole_monitor = FALSE;
-            if ((frame_flags & UURF_FLAG_COMPOSITE) == 0 && monitor != NULL &&
-                GetMonitorInfoA(monitor, &info)) {
+            BOOL have_monitor_info =
+                monitor != NULL && GetMonitorInfoA(monitor, &info);
+            if ((frame_flags & UURF_FLAG_COMPOSITE) == 0 &&
+                have_monitor_info) {
                 whole_monitor =
                     info.rcMonitor.left == requested.left &&
                     info.rcMonitor.top == requested.top &&
@@ -524,7 +615,64 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                     (int64_t)(info.rcMonitor.right - info.rcMonitor.left) * fh ==
                         (int64_t)(info.rcMonitor.bottom - info.rcMonitor.top) * fw;
             }
-            if ((frame_flags & UURF_FLAG_COMPOSITE) != 0) {
+            BOOL monitor_local_crop = FALSE;
+            if ((frame_flags & UURF_FLAG_COMPOSITE) != 0 &&
+                have_monitor_info && source_width > 0 && source_height > 0 &&
+                requested.left >= info.rcMonitor.left &&
+                requested.top >= info.rcMonitor.top &&
+                requested.right <= info.rcMonitor.right &&
+                requested.bottom <= info.rcMonitor.bottom &&
+                info.rcMonitor.right > info.rcMonitor.left &&
+                info.rcMonitor.bottom > info.rcMonitor.top) {
+                int screen_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                int screen_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                const unsigned char *layout = find_frame_monitor(
+                    header, &info.rcMonitor, screen_left, screen_top,
+                    screen_width, screen_height);
+                if (layout != NULL) {
+                    int64_t monitor_width =
+                        (int64_t)info.rcMonitor.right - info.rcMonitor.left;
+                    int64_t monitor_height =
+                        (int64_t)info.rcMonitor.bottom - info.rcMonitor.top;
+                    int64_t local_x0 =
+                        (int64_t)requested.left - info.rcMonitor.left;
+                    int64_t local_y0 =
+                        (int64_t)requested.top - info.rcMonitor.top;
+                    int64_t local_x1 = local_x0 + source_width;
+                    int64_t local_y1 = local_y0 + source_height;
+                    uint32_t frame_x = load_u32(layout + 16);
+                    uint32_t frame_y = load_u32(layout + 20);
+                    uint32_t frame_w = load_u32(layout + 24);
+                    uint32_t frame_h = load_u32(layout + 28);
+                    int64_t sx0 = frame_x + local_x0 * frame_w / monitor_width;
+                    int64_t sy0 = frame_y + local_y0 * frame_h / monitor_height;
+                    int64_t sx1 = frame_x +
+                        (local_x1 * frame_w + monitor_width - 1) / monitor_width;
+                    int64_t sy1 = frame_y +
+                        (local_y1 * frame_h + monitor_height - 1) / monitor_height;
+                    if (frame_w > 0 && frame_h > 0 &&
+                        frame_x <= fw && frame_y <= fh &&
+                        frame_w <= fw - frame_x && frame_h <= fh - frame_y) {
+                        if (sx0 < 0)
+                            sx0 = 0;
+                        if (sy0 < 0)
+                            sy0 = 0;
+                        if (sx1 > fw)
+                            sx1 = fw;
+                        if (sy1 > fh)
+                            sy1 = fh;
+                        if (sx1 > sx0 && sy1 > sy0) {
+                            sx = (int)sx0;
+                            sy = (int)sy0;
+                            sw = (int)(sx1 - sx0);
+                            sh = (int)(sy1 - sy0);
+                            monitor_local_crop = TRUE;
+                        }
+                    }
+                }
+            }
+            if ((frame_flags & UURF_FLAG_COMPOSITE) != 0 &&
+                !monitor_local_crop) {
                 int screen_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
                 int screen_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
                 int64_t sx0 = ((int64_t)source_x - screen_left) * fw / screen_width;
@@ -545,7 +693,8 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                 sy = (int)sy0;
                 sw = (int)(sx1 - sx0);
                 sh = (int)(sy1 - sy0);
-            } else if (whole_monitor) {
+            } else if ((frame_flags & UURF_FLAG_COMPOSITE) == 0 &&
+                       whole_monitor) {
                 sx = 0;
                 sy = 0;
                 sw = (int)fw;

@@ -75,6 +75,11 @@ static int capture_round_trip(void)
     put_u32(transport + 16, stride);
     put_u32(transport + 20, 1);
     put_u64(transport + 24, 1);
+    put_u32(transport + 36, 1);
+    put_u32(transport + UURF_BASE_HEADER_BYTES + 8, width);
+    put_u32(transport + UURF_BASE_HEADER_BYTES + 12, height);
+    put_u32(transport + UURF_BASE_HEADER_BYTES + 24, width);
+    put_u32(transport + UURF_BASE_HEADER_BYTES + 28, height);
     unsigned char *slot = transport + uurf_slot_offset(1, slot_bytes);
     put_u64(slot, 2);
     for (size_t offset = 8; offset < slot_bytes; offset += 4) {

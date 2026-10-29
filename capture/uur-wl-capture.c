@@ -24,7 +24,9 @@
 struct frame_header {
     uint32_t magic, version, width, height, stride, format;
     _Atomic uint64_t total_frames;
-    uint8_t reserved[32];
+    uint32_t flags, monitor_count;
+    uint8_t reserved[24];
+    struct uurf_monitor_layout monitors[UURF_MAX_MONITORS];
 };
 _Static_assert(sizeof(struct frame_header) == UURF_HEADER_BYTES, "frame header ABI");
 
@@ -136,6 +138,16 @@ static int setup_ring(struct capture *c)
     header->width = c->width; header->height = c->height;
     header->stride = c->width * 4; header->format = 1;
     atomic_init(&header->total_frames, 0);
+    header->flags = 0;
+    header->monitor_count = 1;
+    header->monitors[0].logical_x = 0;
+    header->monitors[0].logical_y = 0;
+    header->monitors[0].logical_width = c->width;
+    header->monitors[0].logical_height = c->height;
+    header->monitors[0].frame_x = 0;
+    header->monitors[0].frame_y = 0;
+    header->monitors[0].frame_width = c->width;
+    header->monitors[0].frame_height = c->height;
     for (uint32_t i = 0; i < UURF_SLOT_COUNT; ++i) {
         _Atomic uint64_t *seq = (_Atomic uint64_t *)((uint8_t *)c->ring +
             UURF_HEADER_BYTES + i * (sizeof(uint64_t) + bytes));

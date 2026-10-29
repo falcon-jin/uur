@@ -62,7 +62,7 @@ RAII cleanup terminates only those helper groups and the one managed Wine
 prefix. There are no permanent daemons, global `pkill` calls, or required
 systemd units.
 
-Frame data lives in `$XDG_RUNTIME_DIR/uur/frames.v1` with mode 0600. The path is
+Frame data lives in `$XDG_RUNTIME_DIR/uur/frames.v2` with mode 0600. The path is
 passed through the adapter configuration, so users and concurrent sessions do
 not share a global `/dev/shm` object.
 

@@ -879,7 +879,7 @@ fn process_start_time(pid: u32) -> Result<u64> {
 }
 
 fn frame_path() -> Result<PathBuf> {
-    Ok(crate::config::runtime_dir()?.join("frames.v1"))
+    Ok(crate::config::runtime_dir()?.join("frames.v2"))
 }
 
 fn unix_path_to_wine(path: &Path) -> String {
@@ -1202,8 +1202,8 @@ mod tests {
     #[test]
     fn runtime_path_converts_to_a_wine_z_path() {
         assert_eq!(
-            unix_path_to_wine(Path::new("/run/user/1000/uur/frames.v1")),
-            r"Z:\run\user\1000\uur\frames.v1"
+            unix_path_to_wine(Path::new("/run/user/1000/uur/frames.v2")),
+            r"Z:\run\user\1000\uur\frames.v2"
         );
     }
 }
