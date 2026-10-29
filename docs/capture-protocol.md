@@ -1,13 +1,15 @@
 # Capture frame protocol
 
 How frames travel from the compositor (via PipeWire) into the client's
-capture calls.  Two producers/consumers, one shared file, no locks.
+capture calls. Multiple selected monitor streams are composed into one virtual
+desktop frame in the shared transport; the Windows hook crops each monitor
+request from that frame.
 
 ```text
 xdg-desktop-portal ScreenCast
-        │ (portal-consented session; per-monitor)
+        │ (portal-consented session; one stream per selected monitor)
         ▼
-uur-pw-capture (C) ── PipeWire stream, BGRx, SHM buffers
+uur-pw-capture (C) ── PipeWire streams, BGRx, desktop composition
         │ writes slots, seqlock per slot
         ▼
 $XDG_RUNTIME_DIR/uur/frames.v1  (mode 0600, 64-byte header + 3 slots)
@@ -30,7 +32,8 @@ All integers little-endian.  Total size = 64 + 3 × (8 + stride × height).
 | 16 | u32 | stride (bytes per row) |
 | 20 | u32 | format: 1 = BGRx (32 bits per pixel) |
 | 24 | u64 | total frames written (monotonic counter) |
-| 32..64 | — | reserved, zero |
+| 32 | u32 | flags: bit 0 means the frame is a virtual-desktop composite |
+| 36..64 | — | reserved, zero |
 
 Slot *i* (i = 0, 1, 2) at offset `64 + i × (8 + stride × height)`:
 
@@ -50,12 +53,13 @@ the managed prefix configuration. It is never a global shared-memory name.
 
 ## Geometry and session changes
 
-An exact Wine monitor rectangle maps onto the entire selected frame when their
-aspect ratios match. Pixel dimensions may differ under fractional scaling, where
-Xwayland's render size can exceed the portal's native frame size. Partial regions
-and whole-virtual-desktop requests retain the existing virtual-desktop mapping.
-This does not establish monitor identity between Wine and the portal; selecting
-a non-primary monitor still requires consistent client/input coordinates.
+For one selected stream, an exact Wine monitor rectangle maps onto the entire
+frame when their aspect ratios match. With multiple selected monitor streams,
+the producer uses portal position/size metadata to compose the streams into a
+virtual desktop frame; Wine monitor rectangles then crop their matching region.
+If a portal omits layout metadata, streams are arranged left to right. Fractional
+scaling is normalized to a shared frame scale; each stream is resampled into
+its reported logical rectangle.
 
 Each transport inode has immutable geometry. A negotiated size change creates
 a new mode-0600 file, initializes its header and slots, then atomically replaces

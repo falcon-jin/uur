@@ -189,9 +189,11 @@ uur display source virtual
 ```
 
 The command clears the old restore token so the next Portal session can create
-or select the requested source. X11 exposes its XRandR topology to Wine.
-Wayland currently carries one selected stream; independent multi-stream
-switching is the next display-topology adapter.
+or select the requested source. For `monitor`, the ScreenCast chooser can select
+multiple displays; uur composes those PipeWire streams into the virtual desktop
+frame and crops each Wine monitor request from it. X11 exposes its XRandR
+topology to Wine directly. Older single-monitor restore tokens are cleared once
+after upgrade so the chooser can grant a multi-monitor selection.
 
 ## First run and normal use
 

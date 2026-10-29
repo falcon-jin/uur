@@ -51,6 +51,13 @@ pub struct PortalBackend {
 impl PortalBackend {
     pub fn connect() -> Result<Self> {
         let mut config = crate::config::Config::load()?;
+        if config.capture_source == "monitor" && !config.remote_desktop_multi_select_migrated {
+            // Older RemoteDesktop restore tokens may contain a single-screen
+            // choice. Drop that token once so the portal can ask for all screens.
+            config.remote_desktop_restore_token = None;
+            config.remote_desktop_multi_select_migrated = true;
+            config.store()?;
+        }
         let restore_token = config.remote_desktop_restore_token.clone();
         let (sender, receiver) = unbounded_channel();
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
@@ -142,21 +149,39 @@ async fn portal_worker(
             &session,
             crate::capture::preferred_cursor_mode(&screencast).await?,
             source.into(),
-            false,
+            configured.capture_source == "monitor",
             None,
             PersistMode::DoNot,
         )
         .await?
         .response()?;
     let selection = portal.start(&session, None).await?.response()?;
-    let stream = selection
+    let selected_streams = selection
         .streams()
-        .and_then(|streams| streams.first())
-        .context("RemoteDesktop portal returned no screen stream")?;
+        .context("RemoteDesktop portal returned no screen streams")?;
+    anyhow::ensure!(
+        !selected_streams.is_empty(),
+        "RemoteDesktop portal returned no screen streams"
+    );
+    let streams = selected_streams
+        .iter()
+        .map(|stream| {
+            let (x, y) = stream.position().unwrap_or((i32::MIN, i32::MIN));
+            let (width, height) = stream.size().unwrap_or((0, 0));
+            crate::capture::CaptureStream {
+                node: stream.pipe_wire_node_id(),
+                x,
+                y,
+                width: u32::try_from(width).unwrap_or(0),
+                height: u32::try_from(height).unwrap_or(0),
+            }
+        })
+        .collect::<Vec<_>>();
+    let stream = &selected_streams[0];
     let stream_id = stream.pipe_wire_node_id();
     let (logical_width, logical_height) = stream.size().unwrap_or((65535, 65535));
     let pipewire = screencast.open_pipe_wire_remote(&session).await?;
-    let _capture = CaptureGuard(crate::capture::spawn_helper(pipewire, stream_id)?);
+    let _capture = CaptureGuard(crate::capture::spawn_helper(pipewire, &streams)?);
     let token = selection.restore_token().map(ToOwned::to_owned);
     ready
         .send(Ok(token))

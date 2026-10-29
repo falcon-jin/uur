@@ -3,11 +3,11 @@
 ## Frame sources
 
 - X11 sessions expose the XRandR monitor topology directly to Wine.
-- Wayland monitor and window sources use ScreenCast/PipeWire.
+- Wayland monitor and window sources use ScreenCast/PipeWire. Monitor selection
+  supports multiple outputs and composes their streams into the virtual desktop
+  frame consumed by the Wine capture adapter.
 - `uur display source virtual` requests the portal's Virtual source type and
   stores its restore token.
-- A multi-stream compositor will combine or expose several PipeWire nodes to
-  UU's display topology for independent Wayland screen switching.
 
 ## Codec capabilities
 

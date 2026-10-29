@@ -234,6 +234,7 @@ static HANDLE frame_map_handle = NULL;
 static uint32_t frame_width;
 static uint32_t frame_height;
 static uint32_t frame_stride;
+static uint32_t frame_flags;
 static uint64_t frame_slot_bytes;
 static unsigned char *frame_snapshot;
 static size_t frame_snapshot_capacity;
@@ -280,6 +281,7 @@ static void clear_frame_map(void)
     frame_map = NULL;
     frame_map_handle = NULL;
     frame_map_size = 0;
+    frame_flags = 0;
 }
 
 /* Producers publish immutable geometry via atomic replacement. Re-check the
@@ -347,6 +349,7 @@ static int ensure_frame_map(void)
     frame_width = load_u32(header + 8);
     frame_height = load_u32(header + 12);
     frame_stride = load_u32(header + 16);
+    frame_flags = load_u32(header + 32);
     frame_slot_bytes = 8ull + (uint64_t)frame_stride * frame_height;
     uint64_t expected = UURF_HEADER_BYTES + UURF_SLOT_COUNT * frame_slot_bytes;
     if (frame_width == 0 || frame_height == 0 ||
@@ -492,13 +495,10 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                 screen_width = (int)fw;
             if (screen_height < 1)
                 screen_height = (int)fh;
-            /* The frame holds exactly one monitor, but the client may ask
-             * for that monitor's whole rectangle.  Wine reports the
-             * compositor's monitors in its own order, so the virtual desktop
-             * is only the right basis for a partial request; a complete
-             * monitor request must map onto the whole frame. Fractional
-             * scaling can give Xwayland and the portal different pixel
-             * sizes, so compare aspect ratios rather than resolutions. */
+            /* A single-stream frame represents one selected monitor, so a
+             * complete monitor request maps to the whole frame. Composite
+             * frames already follow the virtual desktop layout and must be
+             * cropped by the request's screen coordinates instead. */
             int sx = 0;
             int sy = 0;
             int sw = 0;
@@ -514,7 +514,8 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
             MONITORINFO info;
             info.cbSize = sizeof(info);
             BOOL whole_monitor = FALSE;
-            if (monitor != NULL && GetMonitorInfoA(monitor, &info)) {
+            if ((frame_flags & UURF_FLAG_COMPOSITE) == 0 && monitor != NULL &&
+                GetMonitorInfoA(monitor, &info)) {
                 whole_monitor =
                     info.rcMonitor.left == requested.left &&
                     info.rcMonitor.top == requested.top &&
@@ -523,7 +524,28 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                     (int64_t)(info.rcMonitor.right - info.rcMonitor.left) * fh ==
                         (int64_t)(info.rcMonitor.bottom - info.rcMonitor.top) * fw;
             }
-            if (whole_monitor) {
+            if ((frame_flags & UURF_FLAG_COMPOSITE) != 0) {
+                int screen_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                int screen_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                int64_t sx0 = ((int64_t)source_x - screen_left) * fw / screen_width;
+                int64_t sy0 = ((int64_t)source_y - screen_top) * fh / screen_height;
+                int64_t sx1 = ((int64_t)source_x + source_width - screen_left) * fw / screen_width;
+                int64_t sy1 = ((int64_t)source_y + source_height - screen_top) * fh / screen_height;
+                if (sx0 < 0)
+                    sx0 = 0;
+                if (sy0 < 0)
+                    sy0 = 0;
+                if (sx1 > fw)
+                    sx1 = fw;
+                if (sy1 > fh)
+                    sy1 = fh;
+                if (sx1 <= sx0 || sy1 <= sy0)
+                    return FALSE;
+                sx = (int)sx0;
+                sy = (int)sy0;
+                sw = (int)(sx1 - sx0);
+                sh = (int)(sy1 - sy0);
+            } else if (whole_monitor) {
                 sx = 0;
                 sy = 0;
                 sw = (int)fw;

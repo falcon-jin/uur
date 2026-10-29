@@ -1,9 +1,9 @@
 //! Portal side of the capture path.
 //!
 //! Negotiates an xdg-desktop-portal ScreenCast session, obtains a private
-//! PipeWire file descriptor and the video node id, then hands both to the
-//! C capture helper (`uur-pw-capture`) which runs the PipeWire stream and
-//! publishes frames into a private XDG runtime file (see
+//! PipeWire file descriptor and the consented video nodes, then hands them to
+//! the C capture helper (`uur-pw-capture`) which runs the PipeWire streams and
+//! composites their frames into a private XDG runtime file (see
 //! docs/capture-protocol.md).
 //!
 //! Consent: the first run shows the compositor's share dialog once.  The
@@ -30,10 +30,19 @@ type PortalSession =
 
 struct PortalCapture {
     fd: OwnedFd,
-    node: u32,
+    streams: Vec<CaptureStream>,
     restore_token: Option<String>,
     session: PortalSession,
     closed: zbus::proxy::SignalStream<'static>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CaptureStream {
+    pub(crate) node: u32,
+    pub(crate) x: i32,
+    pub(crate) y: i32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 /// Run the capture path until interrupted.
@@ -93,7 +102,7 @@ pub fn run() -> Result<()> {
             };
             let PortalCapture {
                 fd: pw_fd,
-                node,
+                streams,
                 session,
                 mut closed,
                 ..
@@ -110,13 +119,18 @@ pub fn run() -> Result<()> {
                 Err(error) => return Err(error),
             };
             initial_session = false;
-            println!("{}", t!("capture.session_ready", node = node));
+            let nodes = streams
+                .iter()
+                .map(|stream| stream.node.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("{}", t!("capture.session_ready", node = nodes));
             match std::fs::remove_file(&frames) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error).context("retiring the previous capture transport"),
             }
-            let mut helper = CaptureHelper(spawn_helper(pw_fd, node)?);
+            let mut helper = CaptureHelper(spawn_capture_helper(pw_fd, &streams)?);
             let mut healthy_since = None;
             let mut portal_closed = false;
             let mut reconfigure = false;
@@ -286,7 +300,16 @@ pub(crate) fn has_frame(path: &Path) -> bool {
 
 /// Start the native PipeWire consumer with a portal-owned descriptor. The
 /// descriptor remains private to the child and is never reopened by path.
-pub(crate) fn spawn_helper(pw_fd: OwnedFd, node: u32) -> Result<Child> {
+pub(crate) fn spawn_helper(pw_fd: OwnedFd, streams: &[CaptureStream]) -> Result<Child> {
+    spawn_capture_helper(pw_fd, streams)
+}
+
+fn spawn_capture_helper(pw_fd: OwnedFd, streams: &[CaptureStream]) -> Result<Child> {
+    anyhow::ensure!(!streams.is_empty(), "ScreenCast returned no streams");
+    anyhow::ensure!(
+        streams.len() <= 16,
+        "too many ScreenCast streams (maximum 16)"
+    );
     // The helper inherits this descriptor: strip close-on-exec and keep the
     // OwnedFd alive across the spawn (closing it would invalidate the number
     // the child receives).
@@ -303,9 +326,19 @@ pub(crate) fn spawn_helper(pw_fd: OwnedFd, node: u32) -> Result<Child> {
 
     let helper = find_helper("uur-pw-capture")?;
     let mut command = Command::new(&helper);
+    let stream_specs = streams
+        .iter()
+        .map(|stream| {
+            format!(
+                "{},{},{},{},{}",
+                stream.node, stream.x, stream.y, stream.width, stream.height
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
     command
         .env("UUR_PW_FD", raw.to_string())
-        .env("UUR_PW_NODE", node.to_string())
+        .env("UUR_PW_STREAMS", stream_specs)
         .env("UUR_FRAME_PATH", frame_path()?);
     if let Ok(debug) = std::env::var("UUR_PW_DEBUG") {
         command.env("PIPEWIRE_DEBUG", debug);
@@ -323,11 +356,20 @@ fn frame_path() -> Result<PathBuf> {
     Ok(crate::config::runtime_dir()?.join("frames.v1"))
 }
 
-/// Open the portal session and return (inherited fd number, node id).
+/// Open the portal session and return its PipeWire streams and node ids.
 /// First attempt reuses the stored restore token; if that fails (stale
 /// token, monitor changed, compositor restart) fall back to one
 /// interactive attempt and store the fresh token.
 async fn portal_session(config: &mut Config, interactive: bool) -> Result<PortalCapture> {
+    if config.capture_source == "monitor" && !config.capture_multi_select_migrated {
+        // A restore token created by an older single-monitor request restores
+        // only that monitor. Ask once for a fresh multi-monitor selection.
+        config.capture_restore_token = None;
+        config.capture_multi_select_migrated = true;
+        config
+            .store()
+            .context("updating multi-monitor capture settings")?;
+    }
     let saved_token = config.capture_restore_token.clone();
     let screencast = ashpd::desktop::screencast::Screencast::new()
         .await
@@ -440,7 +482,7 @@ async fn negotiate(
             &session,
             cursor_mode,
             source.into(),
-            false,
+            matches!(source, ashpd::desktop::screencast::SourceType::Monitor),
             restore_token,
             PersistMode::ExplicitlyRevoked,
         )
@@ -449,9 +491,22 @@ async fn negotiate(
 
     let response = screencast.start(&session, None).await?;
     let streams_response = response.response()?;
-    let streams = streams_response.streams();
-    let stream = streams.first().context("no monitor selected")?;
-    let node = stream.pipe_wire_node_id();
+    let streams = streams_response
+        .streams()
+        .iter()
+        .map(|stream| {
+            let (x, y) = stream.position().unwrap_or((i32::MIN, i32::MIN));
+            let (width, height) = stream.size().unwrap_or((0, 0));
+            CaptureStream {
+                node: stream.pipe_wire_node_id(),
+                x,
+                y,
+                width: u32::try_from(width).unwrap_or(0),
+                height: u32::try_from(height).unwrap_or(0),
+            }
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(!streams.is_empty(), "no monitor selected");
     let fresh_token = streams_response.restore_token().map(String::from);
 
     let fd = screencast
@@ -460,7 +515,7 @@ async fn negotiate(
         .context("opening the PipeWire remote")?;
     Ok(PortalCapture {
         fd,
-        node,
+        streams,
         restore_token: fresh_token,
         session,
         closed,

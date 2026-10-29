@@ -10,7 +10,7 @@
 | X11 multi-monitor | Wine integration | Native Wine/XRandR display topology |
 | Wayland monitor/window selection | available | Persistent portal source selection |
 | Wayland virtual source | available when advertised | `uur display source virtual` → ScreenCast Virtual source |
-| Independent Wayland multi-screen switching | in progress | Multiple PipeWire streams → UU display topology adapter |
+| Wayland multi-screen capture | available | Multiple PipeWire streams → virtual desktop composite → per-monitor crops |
 | Clipboard and phone IME text | planned | RemoteDesktop Clipboard portal, then X11 fallback |
 | Speaker and microphone audio | available through Wine | PulseAudio, pipewire-pulse, or ALSA selected from live capabilities |
 | System-audio loopback and remote mute | Wine integration | WASAPI → winepulse/winealsa |

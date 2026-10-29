@@ -8,6 +8,7 @@
 #define UURF_VERSION 1u
 #define UURF_SLOT_COUNT 3u
 #define UURF_HEADER_BYTES 64u
+#define UURF_FLAG_COMPOSITE 1u
 
 static inline size_t uurf_slot_offset(uint64_t sequence, size_t slot_bytes)
 {

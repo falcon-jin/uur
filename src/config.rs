@@ -22,8 +22,12 @@ pub struct Config {
     pub capture_restore_token: Option<String>,
     /// Persistent permission for the standard RemoteDesktop input portal.
     pub remote_desktop_restore_token: Option<String>,
+    /// Whether the RemoteDesktop portal token was migrated for multi-monitor selection.
+    pub remote_desktop_multi_select_migrated: bool,
     /// Portal source type: monitor, window, or virtual.
     pub capture_source: String,
+    /// Whether the one-time migration to multi-monitor portal selection ran.
+    pub capture_multi_select_migrated: bool,
     /// "portal" uses system consent; "wayland" is explicitly enabled direct monitor capture.
     pub capture_backend: String,
     /// Named Wayland output for direct capture; a single-output session needs no name.
@@ -40,7 +44,9 @@ impl Default for Config {
             pinned_version: None,
             capture_restore_token: None,
             remote_desktop_restore_token: None,
+            remote_desktop_multi_select_migrated: false,
             capture_source: "monitor".into(),
+            capture_multi_select_migrated: false,
             capture_backend: "portal".into(),
             capture_output: None,
         }
