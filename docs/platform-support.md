@@ -184,16 +184,17 @@ choice; this is independent from PipeWire's Wayland video role.
 ```bash
 uur display status
 uur display source monitor
+uur display source monitor --multiple
 uur display source window
 uur display source virtual
 ```
 
 The command clears the old restore token so the next Portal session can create
-or select the requested source. For `monitor`, the ScreenCast chooser can select
+or select the requested source. With `monitor --multiple`, the chooser can select
 multiple displays; uur composes those PipeWire streams into the virtual desktop
 frame and crops each Wine monitor request from it. X11 exposes its XRandR
-topology to Wine directly. Older single-monitor restore tokens are cleared once
-after upgrade so the chooser can grant a multi-monitor selection.
+topology to Wine directly. Upgrades preserve existing restore tokens; multiple
+monitor selection is an explicit choice and applies to the next session.
 
 ## First run and normal use
 

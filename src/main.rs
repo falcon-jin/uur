@@ -157,7 +157,12 @@ enum DisplayAction {
     /// Show the configured source type.
     Status,
     /// Use a monitor, one window, or a portal-provided virtual display.
-    Source { source: DisplaySource },
+    Source {
+        source: DisplaySource,
+        /// Allow selecting several monitors in the next portal consent dialog.
+        #[arg(long)]
+        multiple: bool,
+    },
     /// Choose portal capture, or explicitly enable direct Wayland monitor capture.
     Backend {
         backend: CaptureBackend,
@@ -228,29 +233,32 @@ fn main() -> Result<()> {
             if matches!(action, DisplayAction::Outputs) {
                 return capture::list_wayland_outputs();
             }
-            let mut config = config::Config::load()?;
+            let config = config::Config::load()?;
             match action {
                 DisplayAction::Status => {
                     println!("{}", t!("display.status", source = config.capture_source));
                     println!("capture backend: {}", config.capture_backend);
+                    println!("multiple monitors: {}", config.capture_multiple);
                     if let Some(output) = &config.capture_output {
                         println!("output: {output}");
                     }
                     Ok(())
                 }
                 DisplayAction::Backend { backend, output } => {
-                    config.capture_backend = match backend {
+                    let backend = match backend {
                         CaptureBackend::Portal => "portal",
                         CaptureBackend::Wayland => "wayland",
-                    }
-                    .into();
-                    config.capture_output = output;
-                    if config.capture_backend == "wayland" {
-                        config.capture_source = "monitor".into();
-                    }
-                    config.capture_restore_token = None;
-                    config.remote_desktop_restore_token = None;
-                    config.store()?;
+                    };
+                    let config = config::Config::update(|stored| {
+                        stored.capture_backend = backend.into();
+                        stored.capture_output = output;
+                        if backend == "wayland" {
+                            stored.capture_source = "monitor".into();
+                            stored.capture_multiple = false;
+                        }
+                        stored.capture_restore_token = None;
+                        stored.remote_desktop_restore_token = None;
+                    })?;
                     println!(
                         "{}",
                         if config.capture_backend == "wayland" {
@@ -262,12 +270,25 @@ fn main() -> Result<()> {
                     Ok(())
                 }
                 DisplayAction::Outputs => unreachable!(),
-                DisplayAction::Source { source } => {
-                    config.capture_source = source.as_str().to_string();
-                    config.capture_restore_token = None;
-                    config.remote_desktop_restore_token = None;
-                    config.store()?;
+                DisplayAction::Source { source, multiple } => {
+                    anyhow::ensure!(
+                        !multiple || matches!(&source, DisplaySource::Monitor),
+                        "--multiple is supported only for monitor sources"
+                    );
+                    anyhow::ensure!(
+                        !multiple || config.capture_backend == "portal",
+                        "multi-monitor selection requires the portal capture backend"
+                    );
+                    config::Config::update(|stored| {
+                        stored.capture_source = source.as_str().to_string();
+                        stored.capture_multiple = multiple;
+                        stored.capture_restore_token = None;
+                        stored.remote_desktop_restore_token = None;
+                    })?;
                     println!("{}", t!("display.changed", source = source.as_str()));
+                    println!(
+                        "multiple monitors: {multiple}; selection applies on the next session"
+                    );
                     Ok(())
                 }
             }

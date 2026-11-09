@@ -26,6 +26,8 @@ struct uurf_monitor_layout {
     uint32_t capture_width;
     uint32_t capture_height;
 };
+_Static_assert(sizeof(struct uurf_monitor_layout) == UURF_MONITOR_BYTES,
+               "monitor layout ABI changed");
 
 static inline size_t uurf_slot_offset(uint64_t sequence, size_t slot_bytes)
 {

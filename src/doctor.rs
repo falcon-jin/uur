@@ -351,12 +351,13 @@ pub fn report() -> Result<()> {
         "info",
         "capture backend",
         &format!(
-            "{} ({})",
+            "{} ({}; multiple={})",
             configured.capture_backend,
             configured
                 .capture_output
                 .as_deref()
-                .unwrap_or("selected/default output")
+                .unwrap_or("selected/default output"),
+            configured.capture_multiple
         ),
     );
     let mut preferred = std::env::var("UUR_INPUT_BACKEND").unwrap_or(configured.input_backend);

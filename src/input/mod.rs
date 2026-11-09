@@ -7,6 +7,9 @@ use anyhow::Result;
 /// A desktop input sink.  Records arrive already normalized by `protocol`.
 pub trait InputBackend: Send {
     fn name(&self) -> &'static str;
+    fn check_health(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn key(&mut self, vkey: u16, down: bool) -> Result<()>;
     fn button(&mut self, button: u16, down: bool) -> Result<()>;

@@ -12,7 +12,7 @@ xdg-desktop-portal ScreenCast
 uur-pw-capture (C) ── PipeWire streams, BGRx, desktop composition
         │ writes slots, seqlock per slot
         ▼
-$XDG_RUNTIME_DIR/uur/frames.v2  (mode 0600, 576-byte header + 3 slots)
+$XDG_RUNTIME_DIR/uur/frames.v3  (mode 0600, 704-byte header + 3 slots)
         │ mapped read-only by the PE hook through its configured Wine Z: path
         ▼
 uur-hook.dll ── intercepts static/dynamic gdi32!BitBlt/StretchBlt calls;
@@ -34,7 +34,8 @@ All integers little-endian. Total size = 704 + 3 × (8 + stride × height).
 | 24 | u64 | total frames written (monotonic counter) |
 | 32 | u32 | flags: bit 0 means the frame is a virtual-desktop composite |
 | 36 | u32 | monitor layout record count (1..16) |
-| 40..64 | — | reserved, zero |
+| 40 | u64 | producer CLOCK_MONOTONIC heartbeat in milliseconds; zero if unsupported |
+| 48..64 | — | reserved, zero |
 
 The fixed-size monitor table starts at offset 64 and contains 16 records of
 40 bytes each. Unused records are zero. Each record contains signed logical
@@ -71,6 +72,18 @@ scaling is normalized to a shared frame scale; each stream is resampled into
 its reported logical rectangle. The hook matches Wine monitor bounds to the
 captured layout and crops in monitor-local coordinates, so differing monitor
 resolutions and vertical offsets do not shift the top edge of a screen.
+The capture service's virtual display API uses the composed frame rectangles
+relative to the primary monitor, including a common pixel scale. UI and WebView
+processes retain native display geometry. Raw source pixel sizes remain metadata
+and are never combined with logical origins. Portals without stable output
+identity require the selected monitor count to match Wine's monitor count for
+per-monitor matching; otherwise the composite is used as a whole.
+
+Multiple monitors are explicitly enabled with `uur display source monitor
+--multiple`, followed by a new session and monitor selection in the portal.
+Upgrading preserves existing grants. Choosing `uur display source monitor`
+returns to a single selected source. Absolute input selects the consented node
+containing the logical position, then sends that node's local coordinates.
 
 Each transport inode has immutable geometry. A negotiated size change creates
 a new mode-0600 file, initializes its header and slots, then atomically replaces
@@ -84,7 +97,9 @@ fd extent, readiness fence and CPU-access synchronization. Implicit modifiers
 require a graphics importer and are not advertised by this CPU consumer.
 
 A stream error, lost connection or ten seconds in PAUSED after streaming makes
-the helper exit with status 75. The ScreenCast supervisor retries up to three
+the helper exit with status 75. A ten-second expired producer heartbeat also
+restarts a hung helper, independently of desktop changes. Both ScreenCast and
+combined RemoteDesktop supervisors retry up to three
 times using the saved restore token, with a one-second backoff. Thirty seconds
 of healthy capture resets the retry budget. An unchanged desktop in STREAMING
 does not trigger this watchdog. Recovery keeps the saved token and performs no

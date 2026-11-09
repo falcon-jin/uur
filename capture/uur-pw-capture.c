@@ -50,7 +50,8 @@ struct frame_header {
     _Atomic uint64_t total_frames;
     uint32_t flags;
     uint32_t monitor_count;
-    uint8_t reserved[24];
+    _Atomic uint64_t heartbeat_ms;
+    uint8_t reserved[16];
     struct uurf_monitor_layout monitors[UURF_MAX_MONITORS];
 };
 
@@ -80,6 +81,7 @@ struct capture_stream {
     int32_t layout_y;
     uint32_t logical_width;
     uint32_t logical_height;
+    int provided_logical_size;
     uint32_t width;
     uint32_t height;
     enum spa_video_format format;
@@ -150,6 +152,34 @@ static uint8_t *slot_frame(struct frame_slot *slot)
     return (uint8_t *)slot + sizeof(struct frame_slot);
 }
 
+static struct uurf_monitor_layout monitor_layout(const struct capture *c,
+                                                 const struct capture_stream *s)
+{
+    struct uurf_monitor_layout monitor = {0};
+    monitor.logical_x = s->layout_x;
+    monitor.logical_y = s->layout_y;
+    monitor.logical_width = s->logical_width;
+    monitor.logical_height = s->logical_height;
+    monitor.capture_width = s->width;
+    monitor.capture_height = s->height;
+    if (c->flags == 0) {
+        monitor.frame_width = c->width;
+        monitor.frame_height = c->height;
+    } else {
+        uint64_t left = (uint64_t)((int64_t)s->layout_x - c->layout_x);
+        uint64_t top = (uint64_t)((int64_t)s->layout_y - c->layout_y);
+        uint32_t x0 = scale_floor(left, c->scale_num, c->scale_den);
+        uint32_t y0 = scale_floor(top, c->scale_num, c->scale_den);
+        uint64_t x1 = scale_ceil(left + s->logical_width, c->scale_num, c->scale_den);
+        uint64_t y1 = scale_ceil(top + s->logical_height, c->scale_num, c->scale_den);
+        monitor.frame_x = x0;
+        monitor.frame_y = y0;
+        monitor.frame_width = x1 > x0 ? (uint32_t)(x1 - x0) : 1;
+        monitor.frame_height = y1 > y0 ? (uint32_t)(y1 - y0) : 1;
+    }
+    return monitor;
+}
+
 /* Publish a new inode for every geometry. A Wine reader may still map the
  * previous inode: never truncate or resize memory another process is reading. */
 static int shm_setup(struct capture *c)
@@ -196,36 +226,11 @@ static int shm_setup(struct capture *c)
     header->stride = c->stride;
     header->format = FRAME_FORMAT_BGRX;
     atomic_init(&header->total_frames, 0);
+    atomic_init(&header->heartbeat_ms, monotonic_ms());
     header->flags = c->flags;
     header->monitor_count = c->stream_count;
     for (uint32_t i = 0; i < c->stream_count; ++i) {
-        const struct capture_stream *s = &c->streams[i];
-        struct uurf_monitor_layout *monitor = &header->monitors[i];
-        monitor->logical_x = s->layout_x;
-        monitor->logical_y = s->layout_y;
-        monitor->logical_width = s->logical_width;
-        monitor->logical_height = s->logical_height;
-        monitor->capture_width = s->width;
-        monitor->capture_height = s->height;
-        if (c->flags == 0) {
-            monitor->frame_x = 0;
-            monitor->frame_y = 0;
-            monitor->frame_width = c->width;
-            monitor->frame_height = c->height;
-        } else {
-            uint64_t left = (uint64_t)((int64_t)s->layout_x - c->layout_x);
-            uint64_t top = (uint64_t)((int64_t)s->layout_y - c->layout_y);
-            uint32_t x0 = scale_floor(left, c->scale_num, c->scale_den);
-            uint32_t y0 = scale_floor(top, c->scale_num, c->scale_den);
-            uint32_t x1 = scale_ceil(left + s->logical_width,
-                                     c->scale_num, c->scale_den);
-            uint32_t y1 = scale_ceil(top + s->logical_height,
-                                     c->scale_num, c->scale_den);
-            monitor->frame_x = x0;
-            monitor->frame_y = y0;
-            monitor->frame_width = x1 > x0 ? x1 - x0 : 1;
-            monitor->frame_height = y1 > y0 ? y1 - y0 : 1;
-        }
+        header->monitors[i] = monitor_layout(c, &c->streams[i]);
     }
     for (uint32_t i = 0; i < UURF_SLOT_COUNT; ++i) {
         struct frame_slot *slot = (struct frame_slot *)(mapping +
@@ -358,6 +363,10 @@ static int configure_layout(struct capture *c)
         int64_t next_x = 0;
         for (uint32_t i = 0; i < c->stream_count; ++i) {
             struct capture_stream *s = &c->streams[i];
+            if (missing_position && (next_x < INT32_MIN || next_x > INT32_MAX)) {
+                fprintf(stderr, "monitor layout position is out of range\n");
+                return -1;
+            }
             s->layout_x = missing_position ? (int32_t)next_x : s->x;
             s->layout_y = missing_position ? 0 : s->y;
             next_x = (int64_t)s->layout_x + s->logical_width;
@@ -416,6 +425,16 @@ static int configure_layout(struct capture *c)
     c->flags = flags;
     c->scale_num = scale_num;
     c->scale_den = scale_den;
+    if (!changed && c->shm != NULL) {
+        const struct frame_header *previous = (const struct frame_header *)c->shm;
+        for (uint32_t i = 0; i < c->stream_count; ++i) {
+            struct uurf_monitor_layout current = monitor_layout(c, &c->streams[i]);
+            if (memcmp(&current, &previous->monitors[i], sizeof(current))) {
+                changed = 1;
+                break;
+            }
+        }
+    }
     if (changed || c->composite == NULL || c->shm == NULL) {
         size_t bytes = (size_t)c->stride * height;
         uint8_t *fresh = realloc(c->composite, bytes);
@@ -460,6 +479,13 @@ static void compose_frame(struct capture *c)
             target_width = c->width - left;
         if (target_height > c->height - top)
             target_height = c->height - top;
+        if (target_width == s->width && target_height == s->height) {
+            for (uint32_t row = 0; row < target_height; ++row) {
+                memcpy(c->composite + (size_t)(top + row) * c->stride + (size_t)left * 4,
+                       s->pixels + (size_t)row * s->width * 4, (size_t)target_width * 4);
+            }
+            continue;
+        }
         for (uint32_t row = 0; row < target_height; ++row) {
             uint32_t source_y = (uint32_t)((uint64_t)row * s->height / target_height);
             uint8_t *target = c->composite + (size_t)(top + row) * c->stride + (size_t)left * 4;
@@ -618,6 +644,10 @@ static void on_param_changed(void *userdata, uint32_t id,
                   s->height != info.size.height || s->format != info.format;
     s->width = (uint32_t)info.size.width;
     s->height = (uint32_t)info.size.height;
+    if (!s->provided_logical_size) {
+        s->logical_width = s->width;
+        s->logical_height = s->height;
+    }
     s->format = info.format;
     /* The DMA-BUF path mmaps the fd directly, which is only correct for a
      * linear layout.  A tiled modifier needs a real importer (GBM/EGL), so
@@ -692,6 +722,9 @@ static void on_watchdog(void *userdata, uint64_t expirations)
     struct capture *c = userdata;
     (void)expirations;
     uint64_t now = monotonic_ms();
+    if (c->shm != NULL)
+        atomic_store_explicit(&((struct frame_header *)c->shm)->heartbeat_ms,
+                              now, memory_order_release);
     for (uint32_t i = 0; i < c->stream_count; ++i) {
         struct capture_stream *s = &c->streams[i];
         if (!c->stopping &&
@@ -772,6 +805,7 @@ static int parse_stream_specs(struct capture *c, const char *text)
         s->y = y;
         s->logical_width = width;
         s->logical_height = height;
+        s->provided_logical_size = width != 0 && height != 0;
         item = strtok_r(NULL, ";", &save);
     }
     free(copy);

@@ -275,6 +275,7 @@ static size_t frame_map_size;
 static BY_HANDLE_FILE_INFORMATION frame_identity;
 static ULONGLONG frame_checked_at;
 static SRWLOCK frame_lock = SRWLOCK_INIT;
+static int capture_geometry_enabled;
 
 static char *read_ini_value(const char *path, const char *key);
 
@@ -398,6 +399,19 @@ static int ensure_frame_map(void)
         frame_map_handle = NULL;
         return 0;
     }
+    for (uint32_t i = 0; i < frame_monitor_count; ++i) {
+        const unsigned char *item = header + UURF_BASE_HEADER_BYTES + i * UURF_MONITOR_BYTES;
+        uint32_t x = load_u32(item + 16), y = load_u32(item + 20);
+        uint32_t w = load_u32(item + 24), h = load_u32(item + 28);
+        if (load_u32(item + 8) == 0 || load_u32(item + 12) == 0 ||
+            w == 0 || h == 0 || x >= frame_width || y >= frame_height ||
+            w > frame_width - x || h > frame_height - y) {
+            UnmapViewOfFile(view);
+            CloseHandle(frame_map_handle);
+            frame_map_handle = NULL;
+            return 0;
+        }
+    }
     frame_map_size = (size_t)size.QuadPart;
     frame_map = view;
     frame_identity = identity;
@@ -409,9 +423,8 @@ static int64_t abs_i64(int64_t value)
     return value < 0 ? -value : value;
 }
 
-/* Pick the captured stream corresponding to a Wine monitor. Exact dimensions
- * distinguish the common mixed-resolution setup; normalized layout position
- * and aspect ratio disambiguate equal-sized monitors and scaled desktops. */
+/* Compare relative extents, centers and aspect ratio, so a uniform XWayland
+ * scale cannot make a larger adjacent monitor look like the smaller one. */
 static const unsigned char *find_frame_monitor(const unsigned char *header,
                                                const RECT *target,
                                                int screen_left,
@@ -469,10 +482,10 @@ static const unsigned char *find_frame_monitor(const unsigned char *header,
         int64_t center_y = ((2 * y + height - 2 * min_y) * 1000000) /
                            (2 * (max_y - min_y));
         int64_t size_error =
-            abs_i64(target_width - width) * 1000000 /
-                (target_width > width ? target_width : width) +
-            abs_i64(target_height - height) * 1000000 /
-                (target_height > height ? target_height : height);
+            abs_i64(target_width * 1000000 / screen_width -
+                    width * 1000000 / (max_x - min_x)) +
+            abs_i64(target_height * 1000000 / screen_height -
+                    height * 1000000 / (max_y - min_y));
         int64_t aspect_left = target_width * height;
         int64_t aspect_right = target_height * width;
         int64_t aspect_error =
@@ -480,7 +493,7 @@ static const unsigned char *find_frame_monitor(const unsigned char *header,
             (aspect_left > aspect_right ? aspect_left : aspect_right);
         int64_t position_error = abs_i64(target_x - center_x) +
                                  abs_i64(target_y - center_y);
-        int64_t score = size_error * 16 + position_error * 2 + aspect_error;
+        int64_t score = size_error * 2 + position_error * 4 + aspect_error;
         if (score < best_score) {
             best_score = score;
             best = item;
@@ -511,6 +524,8 @@ static int copy_frame_monitors(const RECT *target, uur_frame_monitor *items,
                                uint32_t *target_index)
 {
     int result = 0;
+    if (!capture_geometry_enabled)
+        return 0;
     AcquireSRWLockExclusive(&frame_lock);
     if (!ensure_frame_map())
         goto done;
@@ -593,14 +608,12 @@ static int frame_monitor_rect(const uur_frame_monitor *items,
 {
     if (items == NULL || rect == NULL || index >= UURF_MAX_MONITORS ||
         primary_index >= UURF_MAX_MONITORS ||
-        items[index].capture_width == 0 || items[index].capture_height == 0)
+        items[index].frame_width == 0 || items[index].frame_height == 0)
         return 0;
-    int64_t left = (int64_t)items[index].logical_x -
-                   items[primary_index].logical_x;
-    int64_t top = (int64_t)items[index].logical_y -
-                  items[primary_index].logical_y;
-    int64_t right = left + items[index].capture_width;
-    int64_t bottom = top + items[index].capture_height;
+    int64_t left = (int64_t)items[index].frame_x - items[primary_index].frame_x;
+    int64_t top = (int64_t)items[index].frame_y - items[primary_index].frame_y;
+    int64_t right = left + items[index].frame_width;
+    int64_t bottom = top + items[index].frame_height;
     if (left < LONG_MIN || top < LONG_MIN || right > LONG_MAX ||
         bottom > LONG_MAX)
         return 0;
@@ -678,8 +691,8 @@ static void remap_devmode(DEVMODEW *mode)
         return;
     mode->dmPosition.x = adjusted.left;
     mode->dmPosition.y = adjusted.top;
-    mode->dmPelsWidth = items[target_index].capture_width;
-    mode->dmPelsHeight = items[target_index].capture_height;
+    mode->dmPelsWidth = items[target_index].frame_width;
+    mode->dmPelsHeight = items[target_index].frame_height;
     mode->dmFields |= DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
 }
 
@@ -698,9 +711,9 @@ static int WINAPI hook_get_system_metrics(int index)
     if (!copy_frame_monitors(NULL, items, &count, &primary_index, NULL))
         return fallback;
     if (index == SM_CXSCREEN)
-        return (int)items[primary_index].capture_width;
+        return (int)items[primary_index].frame_width;
     if (index == SM_CYSCREEN)
-        return (int)items[primary_index].capture_height;
+        return (int)items[primary_index].frame_height;
 
     int64_t min_x = INT64_MAX, min_y = INT64_MAX;
     int64_t max_x = INT64_MIN, max_y = INT64_MIN;
@@ -820,8 +833,8 @@ static BOOL WINAPI hook_enum_display_settings_a(LPCSTR device, DWORD mode_num,
         return result;
     mode->dmPosition.x = adjusted.left;
     mode->dmPosition.y = adjusted.top;
-    mode->dmPelsWidth = items[target_index].capture_width;
-    mode->dmPelsHeight = items[target_index].capture_height;
+    mode->dmPelsWidth = items[target_index].frame_width;
+    mode->dmPelsHeight = items[target_index].frame_height;
     mode->dmFields |= DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
     return result;
 }
@@ -850,8 +863,8 @@ static int WINAPI hook_get_device_caps(HDC dc, int index)
                                       &primary_index, &target_index) ||
         target_index >= count)
         return result;
-    return index == HORZRES ? (int)items[target_index].capture_width
-                            : (int)items[target_index].capture_height;
+    return index == HORZRES ? (int)items[target_index].frame_width
+                            : (int)items[target_index].frame_height;
 }
 
 static LONG WINAPI hook_query_display_config(
@@ -888,20 +901,9 @@ static LONG WINAPI hook_query_display_config(
             continue;
         source->position.x = adjusted.left;
         source->position.y = adjusted.top;
-        source->width = items[target_index].capture_width;
-        source->height = items[target_index].capture_height;
-
-        UINT target_index_mode = paths[i].targetInfo.modeInfoIdx;
-        if (target_index_mode < *mode_count &&
-            modes[target_index_mode].infoType ==
-                DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
-            DISPLAYCONFIG_VIDEO_SIGNAL_INFO *signal =
-                &modes[target_index_mode].targetMode.targetVideoSignalInfo;
-            signal->activeSize.cx = items[target_index].capture_width;
-            signal->activeSize.cy = items[target_index].capture_height;
-            signal->totalSize.cx = items[target_index].capture_width;
-            signal->totalSize.cy = items[target_index].capture_height;
-        }
+        source->width = items[target_index].frame_width;
+        source->height = items[target_index].frame_height;
+        /* Hardware target timings retain their actual clock and scanout. */
     }
     return result;
 }
@@ -1072,84 +1074,45 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                 have_monitor_info && source_width > 0 && source_height > 0) {
                 int screen_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
                 int screen_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                const unsigned char *layout = find_frame_monitor(
-                    header, &info.rcMonitor, screen_left, screen_top,
-                    screen_width, screen_height);
+                RECT crop_monitor = info.rcMonitor;
+                const unsigned char *layout = NULL;
+                /* Projected rectangles must be checked first: a projected
+                 * secondary monitor may lie inside Wine's old primary bounds. */
+                if (capture_geometry_enabled) {
+                    POINT origin = {0, 0};
+                    HMONITOR primary = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+                    MONITORINFO primary_info = {0};
+                    primary_info.cbSize = sizeof(primary_info);
+                    const unsigned char *primary_layout = NULL;
+                    if (primary != NULL && GetMonitorInfoA(primary, &primary_info))
+                        primary_layout = find_frame_monitor(header, &primary_info.rcMonitor,
+                            screen_left, screen_top, screen_width, screen_height);
+                    for (uint32_t i = 0; primary_layout != NULL && i < frame_monitor_count; ++i) {
+                        const unsigned char *item = header + UURF_BASE_HEADER_BYTES + i * UURF_MONITOR_BYTES;
+                        LONG left = (LONG)load_u32(item + 16) - (LONG)load_u32(primary_layout + 16);
+                        LONG top = (LONG)load_u32(item + 20) - (LONG)load_u32(primary_layout + 20);
+                        RECT projected = {left, top, left + (LONG)load_u32(item + 24),
+                                          top + (LONG)load_u32(item + 28)};
+                        if (requested.left >= projected.left && requested.top >= projected.top &&
+                            requested.right <= projected.right && requested.bottom <= projected.bottom) {
+                            layout = item;
+                            crop_monitor = projected;
+                            crop_mode = "stream-local";
+                            break;
+                        }
+                    }
+                }
+                if (layout == NULL)
+                    layout = find_frame_monitor(header, &info.rcMonitor, screen_left, screen_top,
+                                                 screen_width, screen_height);
                 if (layout != NULL) {
                     selected_layout = layout;
                     uint32_t frame_x = load_u32(layout + 16);
                     uint32_t frame_y = load_u32(layout + 20);
                     uint32_t frame_w = load_u32(layout + 24);
                     uint32_t frame_h = load_u32(layout + 28);
-                    RECT crop_monitor = info.rcMonitor;
-                    int64_t monitor_width =
-                        (int64_t)info.rcMonitor.right - info.rcMonitor.left;
-                    int64_t monitor_height =
-                        (int64_t)info.rcMonitor.bottom - info.rcMonitor.top;
-
-                    /* Once the display APIs below advertise the captured
-                     * pixel size, BitBlt requests use that adjusted geometry.
-                     * Match those requests against the corresponding frame
-                     * rectangle while retaining the original Wine geometry as
-                     * a fallback for clients that cached the old mode. */
-                    POINT origin = {0, 0};
-                    HMONITOR primary =
-                        MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
-                    MONITORINFO primary_info;
-                    ZeroMemory(&primary_info, sizeof(primary_info));
-                    primary_info.cbSize = sizeof(primary_info);
-                    if (primary != NULL &&
-                        GetMonitorInfoA(primary, &primary_info)) {
-                        const unsigned char *primary_layout =
-                            find_frame_monitor(header, &primary_info.rcMonitor,
-                                               screen_left, screen_top,
-                                               screen_width, screen_height);
-                        if (primary_layout != NULL) {
-                            int64_t left =
-                                (int32_t)load_u32(layout) -
-                                (int32_t)load_u32(primary_layout);
-                            int64_t top =
-                                (int32_t)load_u32(layout + 4) -
-                                (int32_t)load_u32(primary_layout + 4);
-                            uint32_t capture_w = load_u32(layout + 32);
-                            uint32_t capture_h = load_u32(layout + 36);
-                            if (capture_w > 0 && capture_h > 0 &&
-                                left >= LONG_MIN && top >= LONG_MIN &&
-                                left + capture_w <= LONG_MAX &&
-                                top + capture_h <= LONG_MAX) {
-                                RECT adjusted = {
-                                    (LONG)left, (LONG)top,
-                                    (LONG)(left + capture_w),
-                                    (LONG)(top + capture_h)};
-                                /* A full-stream request is already in captured
-                                 * pixel coordinates. Wine can still report the
-                                 * prior logical rcMonitor size here; scaling
-                                 * against that stale rectangle crops the stream. */
-                                if (source_width > 0 && source_height > 0 &&
-                                    (uint32_t)source_width == capture_w &&
-                                    (uint32_t)source_height == capture_h &&
-                                    frame_w > 0 && frame_h > 0 &&
-                                    frame_x <= fw && frame_y <= fh &&
-                                    frame_w <= fw - frame_x &&
-                                    frame_h <= fh - frame_y) {
-                                    sx = (int)frame_x;
-                                    sy = (int)frame_y;
-                                    sw = (int)frame_w;
-                                    sh = (int)frame_h;
-                                    monitor_local_crop = TRUE;
-                                    crop_mode = "stream-full";
-                                } else if (requested.left >= adjusted.left &&
-                                    requested.top >= adjusted.top &&
-                                    requested.right <= adjusted.right &&
-                                    requested.bottom <= adjusted.bottom) {
-                                    crop_monitor = adjusted;
-                                    monitor_width = capture_w;
-                                    monitor_height = capture_h;
-                                    crop_mode = "stream-local";
-                                }
-                            }
-                        }
-                    }
+                    int64_t monitor_width = (int64_t)crop_monitor.right - crop_monitor.left;
+                    int64_t monitor_height = (int64_t)crop_monitor.bottom - crop_monitor.top;
                     if (!monitor_local_crop &&
                         requested.left >= crop_monitor.left &&
                         requested.top >= crop_monitor.top &&
@@ -1322,8 +1285,20 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                         (unsigned long)capture_h, sx, sy, sw, sh);
                 hook_log(debug);
             }
+            /* Wine's top-down DIB subrectangle path can offset a short
+             * monitor crop from the bottom of the composite. Compact the
+             * chosen rows in-place and draw a whole DIB at source (0,0).
+             * Destination rows precede source rows, so memmove also covers
+             * overlapping crops without another frame-sized allocation. */
+            for (int row = 0; row < sh; ++row)
+                memmove(frame_snapshot + (size_t)row * sw * 4,
+                        frame_snapshot + (size_t)(sy + row) * fstride + (size_t)sx * 4,
+                        (size_t)sw * 4);
+            bmp_header.biWidth = sw;
+            bmp_header.biHeight = -sh;
+            bmp_header.biSizeImage = (DWORD)((size_t)sw * sh * 4);
             int result = StretchDIBits(
-                hdc_dest, x, y, width, height, sx, sy, sw, sh,
+                hdc_dest, x, y, width, height, 0, 0, sw, sh,
                 (const void *)frame_snapshot, (const BITMAPINFO *)&bmp_header,
                 DIB_RGB_COLORS, SRCCOPY);
             ok = result != 0 && (DWORD)result != GDI_ERROR;
@@ -1921,6 +1896,16 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
         return TRUE;
 
     hook_module = instance;
+    WCHAR executable[MAX_PATH];
+    if (GetModuleFileNameW(NULL, executable, MAX_PATH) > 0) {
+        const WCHAR *name = wcsrchr(executable, L'\\');
+        name = name != NULL ? name + 1 : executable;
+        capture_geometry_enabled = lstrcmpiW(name, L"GameViewerServer.exe") == 0 ||
+                                   lstrcmpiW(name, L"GameViewerService.exe") == 0;
+    }
+    WCHAR geometry_option[2];
+    if (GetEnvironmentVariableW(L"UUR_CAPTURE_GEOMETRY", geometry_option, 2) == 1)
+        capture_geometry_enabled = geometry_option[0] == L'1';
     DisableThreadLibraryCalls(instance);
     if (connect_bridge()) {
         hook_log("attach: bridge connected");

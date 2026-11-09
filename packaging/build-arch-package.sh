@@ -18,6 +18,9 @@ command -v makepkg >/dev/null 2>&1 || {
 cargo build --manifest-path "$project_root/Cargo.toml" --release --locked
 "$project_root/hook/build.sh"
 "$project_root/capture/build.sh"
+if [[ -f "$project_root/compat/build.sh" ]]; then
+    "$project_root/compat/build.sh"
+fi
 
 sed -e "s|@UUR_VERSION@|$version|g" \
     -e "s|@UUR_PROJECT_ROOT@|$project_root|g" \

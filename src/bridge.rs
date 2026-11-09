@@ -156,24 +156,47 @@ pub fn serve() -> Result<()> {
     let backend_handle = backend.clone();
     let addr = format!("127.0.0.1:{}", config.bridge_port);
     let listener = TcpListener::bind(&addr).with_context(|| format!("binding {addr}"))?;
+    listener.set_nonblocking(true)?;
     println!("{}", t!("bridge.listening", port = config.bridge_port));
 
     // The service process hooks itself too, so multiple authenticated
     // connections coexist; each gets its own thread.  Injection is
     // serialized through the single backend.
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
+    loop {
+        backend.lock().unwrap().backend.check_health()?;
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                continue
+            }
+            Err(error) => return Err(error).context("accepting hook connection"),
         };
         let config = config.clone();
         let backend_handle = backend_handle.clone();
         thread::spawn(move || {
             let mut stream = stream;
+            if stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .is_err()
+            {
+                return;
+            }
             match authenticate(&mut stream, &config) {
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(_) => return,
+            }
+            if stream.set_read_timeout(None).is_err() {
+                return;
             }
             use input::InputBackend;
             // Read sockets without holding the shared desktop input lock.
@@ -199,7 +222,6 @@ pub fn serve() -> Result<()> {
             let _ = connection.release_all();
         });
     }
-    Ok(())
 }
 
 fn authenticate(stream: &mut TcpStream, config: &Config) -> Result<bool> {

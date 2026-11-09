@@ -110,7 +110,7 @@ pub fn run() -> Result<()> {
                 ..
             } = match opened {
                 Ok(opened) => opened,
-                Err(error) if !initial_session && failures < 3 => {
+                Err(error) if !initial_session && failures < 3 && !user_cancelled(&error) => {
                     failures += 1;
                     eprintln!("capture reconnect {failures}/3 failed: {error:#}");
                     tokio::select! {
@@ -159,6 +159,10 @@ pub fn run() -> Result<()> {
                         if has_frame(&frames) && healthy_since.is_none() {
                             healthy_since = Some(Instant::now());
                         }
+                        if helper_stalled(&frames) {
+                            eprintln!("capture helper heartbeat expired; reconnecting");
+                            break None;
+                        }
                         if let Some(status) = helper.0.try_wait()
                             .context("waiting for capture helper")? {
                             break Some(status);
@@ -191,14 +195,16 @@ pub fn run() -> Result<()> {
                         "capture recovery failed repeatedly; restart uur run to share again"
                     );
                 }
-                let status = status.context("capture helper stopped without an exit status")?;
-                if !matches!(status.code(), Some(0 | 75) | None) {
+                if status
+                    .as_ref()
+                    .is_some_and(|status| !matches!(status.code(), Some(0 | 75) | None))
+                {
                     anyhow::bail!(
-                        "{} ({status}); capture recovery stopped",
+                        "{} ({status:?}); capture recovery stopped",
                         t!("capture.helper_failed")
                     );
                 }
-                eprintln!("capture stream interrupted ({status}); reconnecting {failures}/3");
+                eprintln!("capture stream interrupted ({status:?}); reconnecting {failures}/3");
             }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {},
@@ -222,7 +228,7 @@ pub fn run() -> Result<()> {
     })
 }
 
-async fn watch_display_changes() -> Option<zbus::proxy::SignalStream<'static>> {
+pub(crate) async fn watch_display_changes() -> Option<zbus::proxy::SignalStream<'static>> {
     let connection = zbus::Connection::session().await.ok()?;
     let bus = zbus::fdo::DBusProxy::new(&connection).await.ok()?;
     let name = "org.gnome.Mutter.DisplayConfig".try_into().ok()?;
@@ -241,7 +247,7 @@ async fn watch_display_changes() -> Option<zbus::proxy::SignalStream<'static>> {
     proxy.receive_signal("MonitorsChanged").await.ok()
 }
 
-async fn next_display_change(changes: &mut Option<zbus::proxy::SignalStream<'static>>) {
+pub(crate) async fn next_display_change(changes: &mut Option<zbus::proxy::SignalStream<'static>>) {
     loop {
         match changes.as_mut() {
             Some(stream) => {
@@ -261,7 +267,7 @@ async fn wait_for_stop(stopping: &AtomicBool) {
     }
 }
 
-struct CaptureHelper(Child);
+pub(crate) struct CaptureHelper(pub(crate) Child);
 
 impl Drop for CaptureHelper {
     fn drop(&mut self) {
@@ -299,6 +305,27 @@ pub(crate) fn has_frame(path: &Path) -> bool {
         && field(20) == 1
         && (1..=16).contains(&field(36))
         && u64::from_le_bytes(header[24..32].try_into().unwrap()) > 0
+}
+
+/// The producer heartbeat advances even when the desktop is static. A zero
+/// value belongs to a producer without heartbeat support, never a stale frame.
+pub(crate) fn helper_stalled(path: &Path) -> bool {
+    let mut header = [0u8; 48];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if file.read_exact(&mut header).is_err()
+        || u32::from_le_bytes(header[4..8].try_into().unwrap()) != FRAME_PROTOCOL_VERSION
+    {
+        return false;
+    }
+    let heartbeat = u64::from_le_bytes(header[40..48].try_into().unwrap());
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    if heartbeat == 0 || unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } != 0 {
+        return false;
+    }
+    let milliseconds = (now.tv_sec as u64).saturating_mul(1000) + now.tv_nsec as u64 / 1_000_000;
+    milliseconds.saturating_sub(heartbeat) > 10_000
 }
 
 /// Start the native PipeWire consumer with a portal-owned descriptor. The
@@ -352,11 +379,11 @@ fn spawn_capture_helper(pw_fd: OwnedFd, streams: &[CaptureStream]) -> Result<Chi
     Ok(child)
 }
 
-fn frame_path() -> Result<PathBuf> {
+pub(crate) fn frame_path() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("UUR_FRAME_PATH") {
         return Ok(PathBuf::from(path));
     }
-    Ok(crate::config::runtime_dir()?.join("frames.v2"))
+    Ok(crate::config::runtime_dir()?.join("frames.v3"))
 }
 
 /// Open the portal session and return its PipeWire streams and node ids.
@@ -364,15 +391,6 @@ fn frame_path() -> Result<PathBuf> {
 /// token, monitor changed, compositor restart) fall back to one
 /// interactive attempt and store the fresh token.
 async fn portal_session(config: &mut Config, interactive: bool) -> Result<PortalCapture> {
-    if config.capture_source == "monitor" && !config.capture_multi_select_migrated {
-        // A restore token created by an older single-monitor request restores
-        // only that monitor. Ask once for a fresh multi-monitor selection.
-        config.capture_restore_token = None;
-        config.capture_multi_select_migrated = true;
-        config
-            .store()
-            .context("updating multi-monitor capture settings")?;
-    }
     let saved_token = config.capture_restore_token.clone();
     let screencast = ashpd::desktop::screencast::Screencast::new()
         .await
@@ -386,15 +404,33 @@ async fn portal_session(config: &mut Config, interactive: bool) -> Result<Portal
         .into_iter()
         .chain(interactive.then_some(None))
     {
-        match negotiate(&screencast, source, token.as_deref()).await {
+        match negotiate(
+            &screencast,
+            source,
+            config.capture_multiple,
+            token.as_deref(),
+        )
+        .await
+        {
             Ok(capture) => {
                 if capture.restore_token != saved_token {
                     config.capture_restore_token = capture.restore_token.clone();
-                    config.store().context("storing the new restore token")?;
+                    Config::update(|stored| {
+                        if stored.capture_source == config.capture_source
+                            && stored.capture_multiple == config.capture_multiple
+                            && stored.capture_backend == config.capture_backend
+                        {
+                            stored.capture_restore_token = capture.restore_token.clone();
+                        }
+                    })
+                    .context("storing the new restore token")?;
                 }
                 return Ok(capture);
             }
             Err(error) => {
+                if user_cancelled(&error) {
+                    return Err(error);
+                }
                 last_error = Some(error);
             }
         }
@@ -402,6 +438,20 @@ async fn portal_session(config: &mut Config, interactive: bool) -> Result<Portal
     Err(last_error.unwrap_or_else(|| {
         anyhow!("capture permission could not be restored; restart uur run to share again")
     }))
+}
+
+pub(crate) fn user_cancelled(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        matches!(
+            source.downcast_ref::<ashpd::Error>(),
+            Some(ashpd::Error::Response(
+                ashpd::desktop::ResponseError::Cancelled
+            ))
+        ) || matches!(
+            source.downcast_ref::<ashpd::desktop::ResponseError>(),
+            Some(ashpd::desktop::ResponseError::Cancelled)
+        )
+    })
 }
 
 /// Choose a cursor mode from the flags the portal advertises.
@@ -457,6 +507,7 @@ pub(crate) async fn preferred_cursor_mode(
 async fn negotiate(
     screencast: &ashpd::desktop::screencast::Screencast<'static>,
     source: ashpd::desktop::screencast::SourceType,
+    multiple: bool,
     restore_token: Option<&str>,
 ) -> Result<PortalCapture> {
     use ashpd::desktop::PersistMode;
@@ -485,7 +536,7 @@ async fn negotiate(
             &session,
             cursor_mode,
             source.into(),
-            matches!(source, ashpd::desktop::screencast::SourceType::Monitor),
+            multiple && matches!(source, ashpd::desktop::screencast::SourceType::Monitor),
             restore_token,
             PersistMode::ExplicitlyRevoked,
         )
