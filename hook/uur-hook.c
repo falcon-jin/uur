@@ -1167,8 +1167,9 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                 int screen_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
                 int64_t sx0 = ((int64_t)source_x - screen_left) * fw / screen_width;
                 int64_t sy0 = ((int64_t)source_y - screen_top) * fh / screen_height;
-                int64_t sx1 = ((int64_t)source_x + source_width - screen_left) * fw / screen_width;
-                int64_t sy1 = ((int64_t)source_y + source_height - screen_top) * fh / screen_height;
+                /* Keep a nonempty source rectangle nonempty after scaling. */
+                int64_t sx1 = (((int64_t)source_x + source_width - screen_left) * fw + screen_width - 1) / screen_width;
+                int64_t sy1 = (((int64_t)source_y + source_height - screen_top) * fh + screen_height - 1) / screen_height;
                 if (sx0 < 0)
                     sx0 = 0;
                 if (sy0 < 0)
@@ -1198,9 +1199,11 @@ static BOOL feed_capture_frame_locked(HDC hdc_dest, int x, int y, int width,
                 int64_t sy0 = ((int64_t)source_y - screen_top) * fh /
                               screen_height;
                 int64_t sx1 = ((int64_t)source_x + source_width - screen_left) *
-                              fw / screen_width;
+                              fw + screen_width - 1;
                 int64_t sy1 = ((int64_t)source_y + source_height - screen_top) *
-                              fh / screen_height;
+                              fh + screen_height - 1;
+                sx1 /= screen_width;
+                sy1 /= screen_height;
                 if (sx0 < 0)
                     sx0 = 0;
                 if (sy0 < 0)
